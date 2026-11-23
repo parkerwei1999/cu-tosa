@@ -2,8 +2,8 @@
 
 Storage: INT8 -> int8, INT16 -> int16, INT32 -> int32, INT48 -> int64, BOOL -> int8 (0 / 1).
 An operator runs one of three ways, chosen per operator instance:
-  kernel       a k_<OP> method that reads and writes the stored types (RESCALE, MATMUL INT16 x INT16, the compares,
-               GATHER); it returns None for an attribute combination it does not cover
+  kernel       a k_<OP> method that reads and writes the stored types (RESCALE, MATMUL INT16 x INT16, ADD, SUB, MUL,
+               TABLE, REDUCE_SUM, the compares, GATHER); it returns None for an attribute combination it does not cover
   as stored    the int64 emulator's op_<OP> applied to the stored tensors unchanged, for operators whose result does
                not depend on the element width (MINIMUM, MAXIMUM, SELECT, CLAMP, REDUCE_MAX and the shape operators)
   fallback     the int64 emulator's op_<OP> on tensors widened to int64, its result narrowed to the stored type
@@ -57,12 +57,12 @@ class Emulator(Int64Emulator):
             return c if c.numel() == self.samples else c.sum().expand(self.samples)
         return c.sum()
 
-    def _parts(self, o, x):
-        """how many per-sample parts a checked tensor splits into (Int64Emulator._per_sample)."""
-        if self.samples == 1 or x.dim() == 0 or not self._from_inputs:
+    def _parts(self, o, shape):
+        """how many per-sample parts a checked tensor of this shape splits into (Int64Emulator._per_sample)."""
+        if self.samples == 1 or len(shape) == 0 or not self._from_inputs:
             return 1
-        if next((d for d in x.shape if d != 1), 1) % self.samples:
-            raise ValueError(f"#{o.idx} {o.op}: checked tensor of shape {tuple(x.shape)} has no outermost dimension "
+        if next((d for d in shape if d != 1), 1) % self.samples:
+            raise ValueError(f"#{o.idx} {o.op}: checked tensor of shape {tuple(shape)} has no outermost dimension "
                              f"that splits into {self.samples} samples")
         return self.samples
 
@@ -86,7 +86,7 @@ class Emulator(Int64Emulator):
             s = torch.from_numpy(shift).to(self.device)
         else:
             m, s = int(mult[0]), int(shift[0])
-        parts = self._parts(o, x)
+        parts = self._parts(o, x.shape)
         y, c0, c1 = rescale(x.contiguous(), STORE[out_dt], m, s, izp, ozp, *RANGE[out_dt], scale32, per_channel, parts)
         if self.check:
             first = "apply_scale_32 value outside [-2^(shift-1), 2^(shift-1))" if scale32 \
@@ -103,6 +103,63 @@ class Emulator(Int64Emulator):
             return None
         # |sum| <= K * 2^30 < 2^47 for K <= MAX_K: the INT48 accumulator check of the int64 emulator cannot fail
         return [bmm_i16(A, B)]
+
+    def _k_binary(self, o, code, a, b, what, shift=0):
+        from .kernels.elementwise import binary
+        out_dt = self.g.dtype(o.outputs[0])
+        shape = torch.broadcast_shapes(a.shape, b.shape)
+        if out_dt not in ("INT8", "INT16", "INT32") or a.numel() == 0 or b.numel() == 0:
+            return None
+        y, c = binary(code, a, b, STORE[out_dt], *RANGE[out_dt], shift=shift, samples=self._parts(o, shape))
+        if self.check:
+            self._pending.append((o.idx, o.op, f"{what} outside {out_dt}", self._counts(c)))
+        return [y]
+
+    def k_ADD(self, o, a, b):
+        from .kernels.elementwise import ADD
+        return self._k_binary(o, ADD, a, b, "ADD result")
+
+    def k_SUB(self, o, a, b):
+        from .kernels.elementwise import SUB
+        return self._k_binary(o, SUB, a, b, "SUB result")
+
+    def k_MUL(self, o, a, b, _shift):
+        from .kernels.elementwise import MUL
+        shift = self._scalar(o.inputs[2])
+        if self.g.dtype(o.inputs[0]) != "INT32":
+            if shift != 0:
+                return None  # a REQUIRE failure: stays with the int64 emulator
+            eff = 0
+        else:
+            eff = max(shift, 0)
+        if eff > 62:  # the register would leave int64
+            return None
+        return self._k_binary(o, MUL, a, b, f"MUL result (shift {shift})", shift=eff)
+
+    def k_TABLE(self, o, x, table):
+        from .kernels.elementwise import table as table_kernel
+        dt, out_dt = self.g.dtype(o.inputs[0]), self.g.dtype(o.outputs[0])
+        host = self.g.tensors[o.inputs[1]].data
+        if host is None or x.numel() == 0 or (dt, self.g.dtype(o.inputs[1]), out_dt, host.size) not in (
+                ("INT8", "INT8", "INT8", 256), ("INT16", "INT16", "INT32", 513)):
+            return None
+        if dt == "INT16":
+            slope = np.diff(host.reshape(-1))
+            if ((slope < RANGE["INT16"][0]) | (slope > RANGE["INT16"][1])).any():
+                return None  # the slope REQUIRE can fail: stays with the int64 emulator
+        return [table_kernel(x, table.reshape(-1).contiguous(), STORE[out_dt], dt == "INT16")]
+
+    def k_REDUCE_SUM(self, o, x):
+        from .kernels.elementwise import reduce_sum
+        out_dt = self.g.dtype(o.outputs[0])
+        if out_dt not in ("INT8", "INT16", "INT32") or x.numel() == 0:
+            return None
+        axis = o.attrs["Axis"]
+        shape = tuple(1 if i == axis else d for i, d in enumerate(x.shape))
+        y, c = reduce_sum(x, axis, STORE[out_dt], *RANGE[out_dt], samples=self._parts(o, shape))
+        if self.check:
+            self._pending.append((o.idx, o.op, f"REDUCE_SUM running sum outside {out_dt}", self._counts(c)))
+        return [y]
 
     def k_GREATER(self, o, a, b):
         return [(a > b).to(torch.int8)]

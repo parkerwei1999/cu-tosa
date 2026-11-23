@@ -57,6 +57,71 @@ def rescale_rows(name, path, per_sig, gen):
     return rows
 
 
+REPLAY = ("ADD", "SUB", "MUL", "TABLE", "REDUCE_SUM")
+DATA = {"MUL": 2, "TABLE": 1}  # the operands that carry data; default all
+
+
+def replay_rows(name, path, per_sig, gen):
+    """real ADD / SUB / MUL / TABLE / REDUCE_SUM operators: constants as they are, the other inputs drawn over the
+    whole declared range, over 3/4 of it (some results overflow) and over small values (none do); the kernel against
+    the int64 emulator's operator on the widened tensors. Operators whose inputs all have one shape also run as 4
+    samples."""
+    g = TosaGraphIR(path)
+    ref, cu = Int64Emulator(g, device="cuda"), Emulator(g, device="cuda")
+    groups = defaultdict(list)
+    for o in g.ops:
+        if o.op in REPLAY:
+            data = o.inputs[:DATA.get(o.op, len(o.inputs))]
+            sig = (o.op, tuple(g.dtype(n) for n in data), tuple("const" if g.tensors[n].data is not None else
+                   "x".join(str(int(d != 1)) for d in g.tensors[n].shape) for n in data),
+                   o.attrs.get("Axis"), ref._scalar(o.inputs[2]) > 0 if o.op == "MUL" else None)
+            groups[sig].append(o)
+    rows = []
+    for sig, ops in sorted(groups.items(), key=str):
+        for o in ops[:: max(1, len(ops) // per_sig)][:per_sig]:
+            data = o.inputs[:DATA.get(o.op, len(o.inputs))]
+            var = [n for n in data if g.tensors[n].data is None]
+            shapes = {g.tensors[n].shape for n in var}
+            x4 = len(shapes) == 1 and len(var) == len(data) and len(next(iter(shapes))) > 0 and o.op != "TABLE"
+            for draw in ("full", "3/4", "small") + (("3/4 x4",) if x4 else ()):
+                samples, wide, narrow = (4 if draw.endswith("x4") else 1), [], []
+                for n in o.inputs:
+                    if n in cu.consts or n not in data:
+                        wide.append(ref.consts.get(n))
+                        narrow.append(cu.consts.get(n))
+                        continue
+                    lo, hi = RANGE[g.dtype(n)]
+                    if draw.startswith("3/4"):
+                        lo, hi = 3 * lo // 4, 3 * hi // 4
+                    elif draw == "small":
+                        lo, hi = max(lo, -1000), min(hi, 1000)
+                    shape = g.tensors[n].shape
+                    if samples > 1:
+                        lead = next((i for i, d in enumerate(shape) if d != 1), 0)
+                        shape = tuple(samples * d if i == lead else d for i, d in enumerate(shape))
+                    x = torch.randint(lo, hi + 1, shape, generator=gen, dtype=torch.int64)
+                    if x.numel() > 1:
+                        x.view(-1)[0], x.view(-1)[-1] = lo, hi
+                    wide.append(x.cuda())
+                    narrow.append(x.to(STORE[g.dtype(n)]).cuda())
+                for e in (ref, cu):
+                    e.violations, e._pending, e.samples, e._from_inputs = [], [], samples, True
+                want = getattr(ref, "op_" + o.op)(o, *wide)[0]
+                got = getattr(cu, "k_" + o.op)(o, *narrow)
+                if got is None:
+                    rows.append((name, o.idx, sig, f"{draw}: not covered by the kernel", True))
+                    continue
+                wc = [(m, c.tolist()) for _, _, m, c in ref._pending]
+                gc = [(m, c.tolist()) for _, _, m, c in cu._pending]
+                wc = [(m, c) for m, c in wc if (any(c) if isinstance(c, list) else c)]  # run() drops zero counts
+                gc = [(m, c) for m, c in gc if (any(c) if isinstance(c, list) else c)]
+                ok = bool(torch.equal(got[0].to(torch.int64), want)) and wc == gc \
+                    and got[0].dtype == STORE[g.dtype(o.outputs[0])]
+                nbad = sum(sum(c) if isinstance(c, list) else c for _, c in wc)
+                rows.append((name, o.idx, sig, f"{draw}, {want.numel()} el, {nbad} REQUIRE failures", ok))
+    return rows
+
+
 def matmul_rows(gen):
     rows = []
     for (N, M, K, P) in ((16, 1500, 1500, 64), (16, 228, 64, 1500), (3, 7, 1, 5), (1, 65, 129, 33), (2, 64, 4097, 64)):
@@ -81,6 +146,7 @@ def main(specs):
     for spec in specs:
         name, path = spec.split("=", 1)
         rows += rescale_rows(name, path, 3, gen)
+        rows += replay_rows(name, path, 3, gen)
     bad = [r for r in rows if not r[-1]]
     for r in rows:
         print("ok  " if r[-1] else "FAIL", *r[:-1], flush=True)
