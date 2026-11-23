@@ -23,12 +23,25 @@ Tensors are stored at their TOSA type (INT8 / INT16 / INT32 natively, INT48 in i
 
 `Emulator.how` records the path of every operator of the last run. On a CPU device the whole run is the int64 emulator.
 
+## Limits
+
+These stop a run with an exception; none gives a wrong result.
+
+- Values that do not fit the signed stored type: the output of a RESCALE with `output_unsigned` above the signed
+  maximum (0..255 in an INT8 tensor), or a graph input given as such codes. The int64 emulator carries them; here
+  they raise `NotImplementedError`. The same bits passed as int8 work.
+- More than 65535 samples in one `run(samples=n)` (the samples are an axis of the kernels' launch grid).
+- A kernel's own shape limits (MATMUL / CONV2D: K <= 65280, batch <= 65535, fewer than 2^31 elements per operand)
+  are not limits of the emulator: such an operator takes the fallback.
+
 ## Tests (CUDA)
 
 ```
 PYTHONPATH=. python tests/kernel_check.py name=graph.tosa ...     # each kernel against the int64 emulator's operator
 PYTHONPATH=. python tests/graph_equiv.py name=graph.tosa ...      # whole graphs, bit for bit, with timing
 tests/run_ut_vs_reference.sh <tosa_emu_op_check.py> graph.tosa ...  # operator instances against tosa_reference_model
+PYTHONPATH=. python tests/big_index_check.py                      # flat indices beyond 2^31 (5 GiB of GPU memory)
+PYTHONPATH=. python tests/profile_ops.py name=graph.tosa ...      # time per operator and path
 python proofs/limb_proof.py                                        # Z3: the limb identity and accumulator bounds of MATMUL
 ```
 

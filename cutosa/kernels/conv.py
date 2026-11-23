@@ -69,8 +69,9 @@ def linear(x, w, bias64, wsum64, out_dtype, izp, wzp, lo, hi, saturate, cbuf, c0
     accumulators outside [lo, hi] to the flat element c0 + p of cbuf (int64)."""
     M, K = x.shape
     N = w.shape[0]
-    if K > MAX_K:
-        raise ValueError(f"limb CONV2D is exact only for K <= {MAX_K}, got {K}")
+    if K > MAX_K or N * K >= 2**31 or triton.cdiv(N, 64) > 65535:
+        raise ValueError(f"CONV2D 1x1 with K = {K}, N = {N} is outside the kernel's limits (K <= {MAX_K} for the int32 "
+                         f"row sums, fewer than 2^31 weights)")
     y = torch.empty((M, N), dtype=out_dtype, device=x.device)
     M_per = M // parts
     BM, BN, BK = 64, 64, 32

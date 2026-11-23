@@ -12,6 +12,13 @@ import triton
 import triton.language as tl
 
 MAX_K = 65280  # proofs/limb_proof.py: (2^31 - 1) // 32896
+BM, BN, BK = 64, 64, 32
+
+
+def fits(Bn, M, K, N):
+    """whether bmm_i16 takes these shapes: K within the proof, the launch grid within CUDA's 65535 on its second
+    and third axis, and every element offset (computed in int32 from the strides) below 2^31."""
+    return K <= MAX_K and Bn <= 65535 and triton.cdiv(N, BN) <= 65535 and max(Bn * M * K, Bn * K * N, Bn * M * N) < 2**31
 
 
 @triton.jit
@@ -58,10 +65,10 @@ def bmm_i16(a, b):
     N = b.shape[2]
     if b.shape[0] != Bn or b.shape[1] != K:
         raise ValueError(f"MATMUL shapes {tuple(a.shape)} x {tuple(b.shape)}")
-    if K > MAX_K:
-        raise ValueError(f"limb MATMUL is exact only for K <= {MAX_K} (int32 row sums), got {K}")
+    if not fits(Bn, M, K, N):
+        raise ValueError(f"MATMUL {tuple(a.shape)} x {tuple(b.shape)} is outside the kernel's limits (K <= {MAX_K} "
+                         f"for the int32 row sums, batch <= 65535, fewer than 2^31 elements)")
     c = torch.empty((Bn, M, N), dtype=torch.int64, device=a.device)
-    BM, BN, BK = 64, 64, 32
     grid = (triton.cdiv(M, BM), triton.cdiv(N, BN), Bn)
     _bmm_i16[grid](a, b, c, M, N, K, *a.stride(), *b.stride(), *c.stride(), BM=BM, BN=BN, BK=BK, num_stages=2)
     return c

@@ -23,7 +23,7 @@ def _rescale(x_ptr, y_ptr, c_ptr, m_ptr, s_ptr, n_per, c0, c1, C, izp, m, s, ozp
     the elements whose result + output_zp is outside INT32."""
     pid = tl.program_id(0)
     sid = tl.program_id(1)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    offs = pid.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)  # int64: a part may hold more than 2^31 elements
     mask = offs < n_per
     g = sid.to(tl.int64) * n_per + offs
     v = tl.load(x_ptr + g, mask=mask, other=0).to(tl.int64) - izp

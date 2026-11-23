@@ -26,7 +26,7 @@ def _binary(a_ptr, b_ptr, y_ptr, c_ptr, n_per, c0, ia, na, ib, nb_b, shift, lo, 
             OP: tl.constexpr, A_FLAT: tl.constexpr, B_FLAT: tl.constexpr, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
     sid = tl.program_id(1)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    offs = pid.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)  # int64 flat indices throughout
     mask = offs < n_per
     g = sid.to(tl.int64) * n_per + offs
     if A_FLAT:
@@ -99,7 +99,7 @@ def binary(op, a, b, out_dtype, lo, hi, cbuf, c0, shift=0, parts=1):
 def _table(x_ptr, t_ptr, y_ptr, n, WIDE: tl.constexpr, BLOCK: tl.constexpr):
     """TABLE. WIDE: INT16 input, 513 INT16 entries, INT32 output = entry * 128 + slope * fraction (9-bit index, 7-bit
     fraction). Else: INT8 input, 256 INT8 entries."""
-    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < n
     x = tl.load(x_ptr + offs, mask=mask, other=0).to(tl.int32)
     if WIDE:
@@ -128,9 +128,10 @@ def _reduce_sum(x_ptr, y_ptr, c_ptr, n_per, c0, L, inner, lo, hi, BLOCK: tl.cons
     the total are stored."""
     pid = tl.program_id(0)
     sid = tl.program_id(1)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    offs = pid.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)  # int64 flat indices throughout
     mask = offs < n_per
     j = sid.to(tl.int64) * n_per + offs
+    inner = inner.to(tl.int64)
     base = (j // inner) * (L * inner) + (j % inner)
     acc = tl.zeros((BLOCK,), dtype=tl.int64)
     bad = tl.zeros((BLOCK,), dtype=tl.int64)
@@ -150,7 +151,7 @@ def _reduce_sum_last(x_ptr, y_ptr, c_ptr, n_per, c0, L, lo, hi, BJ: tl.constexpr
     that exists."""
     pid = tl.program_id(0)
     sid = tl.program_id(1)
-    rj = pid * BJ + tl.arange(0, BJ)
+    rj = pid.to(tl.int64) * BJ + tl.arange(0, BJ)
     mj = rj < n_per
     j = sid.to(tl.int64) * n_per + rj
     rk = tl.arange(0, BK)

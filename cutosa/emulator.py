@@ -61,6 +61,8 @@ class Emulator(Int64Emulator):
 
     def _begin(self, samples):
         """reset the REQUIRE records for a run of `samples` samples."""
+        if samples > 65535:  # the samples are one axis of the kernels' launch grid
+            raise NotImplementedError(f"{samples} samples in one run (the kernels take at most 65535)")
         self.violations, self._pending, self.samples, self._slots = [], [], samples, []
         rows = 2 * len(self.g.ops) + 1  # at most 2 counters per operator; the last row takes the unchecked counts
         if self._cbuf is None or self._cbuf.numel() != rows * samples:
@@ -89,7 +91,7 @@ class Emulator(Int64Emulator):
 
     def _parts(self, o, shape):
         """how many per-sample parts a checked tensor of this shape splits into (Int64Emulator._per_sample)."""
-        if self.samples == 1 or len(shape) == 0 or not self._from_inputs:
+        if self.samples == 1 or len(shape) == 0 or not self._from_inputs or not self.check:
             return 1
         if next((d for d in shape if d != 1), 1) % self.samples:
             raise ValueError(f"#{o.idx} {o.op}: checked tensor of shape {tuple(shape)} has no outermost dimension "
@@ -125,11 +127,12 @@ class Emulator(Int64Emulator):
                         self._cbuf, c0, c1, parts)]
 
     def k_MATMUL(self, o, A, B, _azp, _bzp):
-        from .kernels.matmul import MAX_K, bmm_i16
+        from .kernels.matmul import bmm_i16, fits
         if self.g.dtype(o.inputs[0]) != "INT16" or self.g.dtype(o.inputs[1]) != "INT16" \
                 or self.g.dtype(o.outputs[0]) != "INT48" or self._scalar(o.inputs[2]) or self._scalar(o.inputs[3]) \
-                or A.shape[-1] > MAX_K or A.numel() == 0 or B.numel() == 0:
+                or A.numel() == 0 or B.numel() == 0 or not fits(*A.shape, B.shape[2]):
             return None
+        self._parts(o, (A.shape[0], A.shape[1], B.shape[2]))  # the int64 emulator's check that the samples split it
         # |sum| <= K * 2^30 < 2^47 for K <= MAX_K: the INT48 accumulator check of the int64 emulator cannot fail
         return [bmm_i16(A, B)]
 
@@ -196,7 +199,8 @@ class Emulator(Int64Emulator):
         OC, KH, KW, _ = w.shape
         M = N * IH * IW
         if KH != 1 or KW != 1 or tuple(a["Stride"]) != (1, 1) or any(a["Pad"]) or g.dtype(o.inputs[1]) != "INT8" \
-                or (in_dt, out_dt) not in (("INT8", "INT32"), ("INT16", "INT48")) or IC > MAX_K or M == 0 or OC == 0:
+                or (in_dt, out_dt) not in (("INT8", "INT32"), ("INT16", "INT48")) or IC > MAX_K or M == 0 or OC == 0 \
+                or OC * IC >= 2**31 or OC > 65535 * 64:
             return None
         parts = self._parts(o, (N, IH, IW, OC))
         if parts > 1 and M % parts:  # the samples split the output channels
@@ -228,6 +232,10 @@ class Emulator(Int64Emulator):
     def run(self, inputs, hook=None, keep=(), samples=1):
         if not self.native:
             return super().run(inputs, hook=hook, keep=keep, samples=samples)
+        with torch.cuda.device(self.device):  # Triton launches on torch's current device
+            return self._run(inputs, hook, keep, samples)
+
+    def _run(self, inputs, hook, keep, samples):
         g = self.g
         if len(inputs) != len(g.inputs):
             raise ValueError(f"graph has {len(g.inputs)} inputs, got {len(inputs)}")
@@ -238,6 +246,8 @@ class Emulator(Int64Emulator):
             t = torch.as_tensor(np.asarray(x)) if not isinstance(x, torch.Tensor) else x
             if tuple(t.shape) != g.tensors[name].shape:
                 raise ValueError(f"input {name}: shape {tuple(t.shape)} != {g.tensors[name].shape}")
+            if t.dtype != STORE[g.dtype(name)]:  # int64 first, as the int64 emulator reads it (any numpy integer type)
+                t = t.to(torch.int64)
             env[name] = self._narrow(name, t.to(self.device), always_verify=True)
         keep = set(keep) | set(g.outputs)
         for o in g.ops:
