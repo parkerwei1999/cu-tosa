@@ -2,12 +2,17 @@
 
 Storage: INT8 -> int8, INT16 -> int16, INT32 -> int32, INT48 -> int64, BOOL -> int8 (0 / 1).
 An operator runs one of three ways, chosen per operator instance:
-  kernel       a k_<OP> method that reads and writes the stored types (RESCALE, MATMUL INT16 x INT16, ADD, SUB, MUL,
-               TABLE, REDUCE_SUM, the compares, GATHER); it returns None for an attribute combination it does not cover
+  kernel       a k_<OP> method that reads and writes the stored types (RESCALE, MATMUL INT16 x INT16, CONV2D 1x1,
+               ADD, SUB, MUL, TABLE, REDUCE_SUM, the compares, GATHER); it returns None for an attribute combination
+               it does not cover
   as stored    the int64 emulator's op_<OP> applied to the stored tensors unchanged, for operators whose result does
                not depend on the element width (MINIMUM, MAXIMUM, SELECT, CLAMP, REDUCE_MAX and the shape operators)
   fallback     the int64 emulator's op_<OP> on tensors widened to int64, its result narrowed to the stored type
 On a CPU device everything is the int64 emulator (the kernels are CUDA only).
+
+REQUIRE counts: a kernel adds its counts into a row of one int64 buffer [rows, samples] that lives on the device for
+the whole run (Emulator._slot hands out the rows); the fallback operators queue device tensors as the int64 emulator
+does. Both are read once at the end of run().
 
 Interface and results are those of int64_ref.Emulator: run(), violations, graph_status().
 """
@@ -30,9 +35,12 @@ class Emulator(Int64Emulator):
         self.native = self.device.type == "cuda"
         self.verify_narrow = verify_narrow
         self.how = {}  # op index -> "kernel" / "stored" / "fallback" (filled by run)
+        self._prep = {}  # op index -> device tensors derived from the operator's constants (built on first use)
+        self._slots, self._cbuf = [], None
         if self.native:
             for n, t in list(self.consts.items()):
                 self.consts[n] = self._narrow(n, t, always_verify=True)
+            self._begin(1)
 
     # -- storage -----------------------------------------------------------------------------------------------------
     def _narrow(self, name, t, always_verify=False):
@@ -51,11 +59,33 @@ class Emulator(Int64Emulator):
     def _widen(t):
         return t if t is None or t.dtype == torch.int64 else t.to(torch.int64)
 
-    def _counts(self, c):
-        """a kernel's per-part REQUIRE counts in the form Int64Emulator._count_bad queues them."""
-        if self.samples > 1:
-            return c if c.numel() == self.samples else c.sum().expand(self.samples)
-        return c.sum()
+    def _begin(self, samples):
+        """reset the REQUIRE records for a run of `samples` samples."""
+        self.violations, self._pending, self.samples, self._slots = [], [], samples, []
+        rows = 2 * len(self.g.ops) + 1  # at most 2 counters per operator; the last row takes the unchecked counts
+        if self._cbuf is None or self._cbuf.numel() != rows * samples:
+            self._cbuf = torch.zeros(rows * samples, dtype=torch.int64, device=self.device)
+        else:
+            self._cbuf.zero_()
+
+    def _slot(self, o, msg, parts):
+        """-> the flat offset in self._cbuf of a new counter row for this REQUIRE: part p of the checked tensor adds to
+        offset + p. parts is self.samples, or 1 for a check that does not split by sample (its count then stands for
+        every sample, as in Int64Emulator._per_sample)."""
+        if not self.check:
+            return self._cbuf.numel() - self.samples
+        self._slots.append((o.idx, o.op, msg, parts == self.samples))
+        return (len(self._slots) - 1) * self.samples
+
+    def _slot_records(self):
+        """the kernels' REQUIRE records of this run, zero counts included: [(op index, op, message, count)], count =
+        an int, or a list per sample when samples > 1. One transfer from the device."""
+        if not self._slots:
+            return []
+        n = len(self._slots)
+        counts = self._cbuf[:n * self.samples].view(n, self.samples).cpu().tolist()
+        return [(i, op, msg, (c if per_part else [c[0]] * self.samples) if self.samples > 1 else c[0])
+                for (i, op, msg, per_part), c in zip(self._slots, counts)]
 
     def _parts(self, o, shape):
         """how many per-sample parts a checked tensor of this shape splits into (Int64Emulator._per_sample)."""
@@ -82,18 +112,17 @@ class Emulator(Int64Emulator):
         out_dt = self.g.dtype(o.outputs[0])
         izp, ozp = self._scalar(o.inputs[3]), self._scalar(o.inputs[4])
         if per_channel:
-            m = torch.from_numpy(mult).to(self.device)
-            s = torch.from_numpy(shift).to(self.device)
+            if o.idx not in self._prep:
+                self._prep[o.idx] = (torch.from_numpy(mult).to(self.device), torch.from_numpy(shift).to(self.device))
+            m, s = self._prep[o.idx]
         else:
             m, s = int(mult[0]), int(shift[0])
         parts = self._parts(o, x.shape)
-        y, c0, c1 = rescale(x.contiguous(), STORE[out_dt], m, s, izp, ozp, *RANGE[out_dt], scale32, per_channel, parts)
-        if self.check:
-            first = "apply_scale_32 value outside [-2^(shift-1), 2^(shift-1))" if scale32 \
-                else "apply_scale_16 result outside INT32"
-            self._pending.append((o.idx, o.op, first, self._counts(c0)))
-            self._pending.append((o.idx, o.op, "RESCALE result + output_zp outside INT32", self._counts(c1)))
-        return [y]
+        c0 = self._slot(o, "apply_scale_32 value outside [-2^(shift-1), 2^(shift-1))" if scale32
+                        else "apply_scale_16 result outside INT32", parts)
+        c1 = self._slot(o, "RESCALE result + output_zp outside INT32", parts)
+        return [rescale(x.contiguous(), STORE[out_dt], m, s, izp, ozp, *RANGE[out_dt], scale32, per_channel,
+                        self._cbuf, c0, c1, parts)]
 
     def k_MATMUL(self, o, A, B, _azp, _bzp):
         from .kernels.matmul import MAX_K, bmm_i16
@@ -105,15 +134,14 @@ class Emulator(Int64Emulator):
         return [bmm_i16(A, B)]
 
     def _k_binary(self, o, code, a, b, what, shift=0):
-        from .kernels.elementwise import binary
+        from .kernels.elementwise import binary, broadcast_shape
         out_dt = self.g.dtype(o.outputs[0])
-        shape = torch.broadcast_shapes(a.shape, b.shape)
+        shape = broadcast_shape(a.shape, b.shape)
         if out_dt not in ("INT8", "INT16", "INT32") or a.numel() == 0 or b.numel() == 0:
             return None
-        y, c = binary(code, a, b, STORE[out_dt], *RANGE[out_dt], shift=shift, samples=self._parts(o, shape))
-        if self.check:
-            self._pending.append((o.idx, o.op, f"{what} outside {out_dt}", self._counts(c)))
-        return [y]
+        parts = self._parts(o, shape)
+        c0 = self._slot(o, f"{what} outside {out_dt}", parts)
+        return [binary(code, a, b, STORE[out_dt], *RANGE[out_dt], self._cbuf, c0, shift=shift, parts=parts)]
 
     def k_ADD(self, o, a, b):
         from .kernels.elementwise import ADD
@@ -156,10 +184,36 @@ class Emulator(Int64Emulator):
             return None
         axis = o.attrs["Axis"]
         shape = tuple(1 if i == axis else d for i, d in enumerate(x.shape))
-        y, c = reduce_sum(x, axis, STORE[out_dt], *RANGE[out_dt], samples=self._parts(o, shape))
-        if self.check:
-            self._pending.append((o.idx, o.op, f"REDUCE_SUM running sum outside {out_dt}", self._counts(c)))
-        return [y]
+        parts = self._parts(o, shape)
+        c0 = self._slot(o, f"REDUCE_SUM running sum outside {out_dt}", parts)
+        return [reduce_sum(x, axis, STORE[out_dt], *RANGE[out_dt], self._cbuf, c0, parts=parts)]
+
+    def k_CONV2D(self, o, x, w, bias, _izp, _wzp):
+        from .kernels.conv import MAX_K, linear
+        a, g = o.attrs, self.g
+        in_dt, out_dt = g.dtype(o.inputs[0]), g.dtype(o.outputs[0])
+        N, IH, IW, IC = x.shape
+        OC, KH, KW, _ = w.shape
+        M = N * IH * IW
+        if KH != 1 or KW != 1 or tuple(a["Stride"]) != (1, 1) or any(a["Pad"]) or g.dtype(o.inputs[1]) != "INT8" \
+                or (in_dt, out_dt) not in (("INT8", "INT32"), ("INT16", "INT48")) or IC > MAX_K or M == 0 or OC == 0:
+            return None
+        parts = self._parts(o, (N, IH, IW, OC))
+        if parts > 1 and M % parts:  # the samples split the output channels
+            return None
+        prep = self._prep.get(o.idx)
+        if prep is None:
+            w2 = w.reshape(OC, IC).contiguous()
+            prep = (w2, w2.sum(1, dtype=torch.int64), bias.reshape(-1).to(torch.int64).expand(OC).contiguous())
+            if o.inputs[1] in self.consts and o.inputs[2] in self.consts:
+                self._prep[o.idx] = prep
+        w2, wsum, bias64 = prep
+        saturate = out_dt == "INT48"
+        c0 = self._slot(o, ("int48 accumulator (saturated)" if saturate else "int32 accumulator overflow (wrapped)")
+                        + f" outside {out_dt}", parts)
+        y = linear(x.reshape(M, IC).contiguous(), w2, bias64, wsum, STORE[out_dt], self._scalar(o.inputs[3]),
+                   self._scalar(o.inputs[4]), *RANGE[out_dt], saturate, self._cbuf, c0, parts)
+        return [y.reshape(N, IH, IW, OC)]
 
     def k_GREATER(self, o, a, b):
         return [(a > b).to(torch.int8)]
@@ -177,7 +231,7 @@ class Emulator(Int64Emulator):
         g = self.g
         if len(inputs) != len(g.inputs):
             raise ValueError(f"graph has {len(g.inputs)} inputs, got {len(inputs)}")
-        self.violations, self._pending, self.samples = [], [], samples
+        self._begin(samples)
         from_inputs = set(g.inputs)
         env = dict(self.consts)
         for name, x in zip(g.inputs, inputs):
@@ -221,12 +275,13 @@ class Emulator(Int64Emulator):
                 if self.last_use.get(n) == o.idx and n not in keep and n not in self.consts:
                     env.pop(n, None)
         self.env = {n: env[n] for n in keep if n in env}
+        records = self._slot_records()  # an operator is on one path, so its records keep their order in the sort
         if self._pending:
             counts = torch.stack([c for *_, c in self._pending]).cpu().tolist()
-            self.violations += [(i, op, msg, n) for (i, op, msg, _), n in zip(self._pending, counts) if any(n)] \
-                if self.samples > 1 else [(i, op, msg, n) for (i, op, msg, _), n in zip(self._pending, counts) if n]
-            self.violations.sort(key=lambda v: v[0])
+            records += [(i, op, msg, n) for (i, op, msg, _), n in zip(self._pending, counts)]
             self._pending = []
+        self.violations += [r for r in records if (any(r[3]) if self.samples > 1 else r[3])]
+        self.violations.sort(key=lambda v: v[0])
         return [self.to_numpy(n, env[n]) for n in g.outputs]
 
 

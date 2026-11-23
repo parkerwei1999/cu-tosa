@@ -15,6 +15,13 @@ from cutosa import RANGE, STORE, Emulator, Int64Emulator, TosaGraphIR
 from cutosa.kernels.matmul import bmm_i16
 
 
+def begin(ref, cu, samples):
+    """what run() sets before the operators: empty REQUIRE records, the sample count, an operator that reads data."""
+    ref.violations, ref._pending, ref.samples, ref._from_inputs = [], [], samples, True
+    cu._begin(samples)
+    cu._from_inputs = True
+
+
 def rescale_rows(name, path, per_sig, gen):
     g = TosaGraphIR(path)
     ref, cu = Int64Emulator(g, device="cuda"), Emulator(g, device="cuda")
@@ -41,8 +48,7 @@ def rescale_rows(name, path, per_sig, gen):
                 x.view(-1)[0], x.view(-1)[-1] = lo, hi
                 x = x.cuda()
                 fits = RANGE[in_dt][0] <= lo and hi <= RANGE[in_dt][1]
-                for e in (ref, cu):
-                    e.violations, e._pending, e.samples, e._from_inputs = [], [], samples, True
+                begin(ref, cu, samples)
                 want = ref.op_RESCALE(o, x, None, None, None, None)[0]
                 # a wide draw does not fit the stored input type: feed the kernel int64 storage for it
                 got = cu.k_RESCALE(o, x.to(STORE[in_dt]) if fits else x, None, None, None, None)
@@ -50,15 +56,15 @@ def rescale_rows(name, path, per_sig, gen):
                     rows.append((name, o.idx, sig, label, "not covered by the kernel", True))
                     continue
                 wc = [(m, c.tolist()) for _, _, m, c in ref._pending]
-                gc = [(m, c.tolist()) for _, _, m, c in cu._pending]
+                gc = [(m, c) for _, _, m, c in cu._slot_records()]
                 ok = bool(torch.equal(got[0].to(torch.int64), want)) and wc == gc and got[0].dtype == STORE[sig[1]]
                 nbad = sum(sum(c) if isinstance(c, list) else c for _, c in wc)
                 rows.append((name, o.idx, sig, f"{label}, {x.numel()} el, {nbad} REQUIRE failures", ok))
     return rows
 
 
-REPLAY = ("ADD", "SUB", "MUL", "TABLE", "REDUCE_SUM")
-DATA = {"MUL": 2, "TABLE": 1}  # the operands that carry data; default all
+REPLAY = ("ADD", "SUB", "MUL", "TABLE", "REDUCE_SUM", "CONV2D")
+DATA = {"MUL": 2, "TABLE": 1, "CONV2D": 3}  # the operands that carry data; default all
 
 
 def replay_rows(name, path, per_sig, gen):
@@ -82,7 +88,8 @@ def replay_rows(name, path, per_sig, gen):
             data = o.inputs[:DATA.get(o.op, len(o.inputs))]
             var = [n for n in data if g.tensors[n].data is None]
             shapes = {g.tensors[n].shape for n in var}
-            x4 = len(shapes) == 1 and len(var) == len(data) and len(next(iter(shapes))) > 0 and o.op != "TABLE"
+            x4 = len(shapes) == 1 and (len(var) == len(data) or o.op == "CONV2D") and len(next(iter(shapes))) > 0 \
+                and o.op != "TABLE" and not (o.op == "CONV2D" and all(d == 1 for d in next(iter(shapes))[:3]))
             for draw in ("full", "3/4", "small") + (("3/4 x4",) if x4 else ()):
                 samples, wide, narrow = (4 if draw.endswith("x4") else 1), [], []
                 for n in o.inputs:
@@ -104,21 +111,52 @@ def replay_rows(name, path, per_sig, gen):
                         x.view(-1)[0], x.view(-1)[-1] = lo, hi
                     wide.append(x.cuda())
                     narrow.append(x.to(STORE[g.dtype(n)]).cuda())
-                for e in (ref, cu):
-                    e.violations, e._pending, e.samples, e._from_inputs = [], [], samples, True
+                begin(ref, cu, samples)
                 want = getattr(ref, "op_" + o.op)(o, *wide)[0]
                 got = getattr(cu, "k_" + o.op)(o, *narrow)
                 if got is None:
                     rows.append((name, o.idx, sig, f"{draw}: not covered by the kernel", True))
                     continue
                 wc = [(m, c.tolist()) for _, _, m, c in ref._pending]
-                gc = [(m, c.tolist()) for _, _, m, c in cu._pending]
+                gc = [(m, c) for _, _, m, c in cu._slot_records()]
                 wc = [(m, c) for m, c in wc if (any(c) if isinstance(c, list) else c)]  # run() drops zero counts
                 gc = [(m, c) for m, c in gc if (any(c) if isinstance(c, list) else c)]
                 ok = bool(torch.equal(got[0].to(torch.int64), want)) and wc == gc \
                     and got[0].dtype == STORE[g.dtype(o.outputs[0])]
                 nbad = sum(sum(c) if isinstance(c, list) else c for _, c in wc)
                 rows.append((name, o.idx, sig, f"{draw}, {want.numel()} el, {nbad} REQUIRE failures", ok))
+    return rows
+
+
+def linear_rows(gen):
+    """the 1x1 CONV2D kernel on synthetic operands against an exact int64 product: zero points, a bias that pushes
+    part of the accumulators out of the output type (wrap for INT32, saturation for INT48), 1 and 4 parts."""
+    from cutosa.kernels.conv import linear
+    rows = []
+    for dt, out_dt, M, K, N, izp, wzp, big in (
+            ("INT8", "INT32", 8, 1, 3, 0, 0, 0), ("INT8", "INT32", 196, 192, 768, -128, 0, 0),
+            ("INT8", "INT32", 200, 77, 65, 5, -3, 2**31 - 100000), ("INT8", "INT32", 64, 1000, 130, 127, 127, -2**31),
+            ("INT16", "INT48", 8, 1, 3, 0, 0, 0), ("INT16", "INT48", 1500, 384, 1536, 0, 0, 0),
+            ("INT16", "INT48", 200, 77, 65, 0, 2, 2**47 - 10**8), ("INT16", "INT48", 64, 3000, 130, 0, -7, -2**47)):
+        lo, hi = RANGE[dt]
+        x = torch.randint(lo, hi + 1, (M, K), generator=gen, dtype=torch.int64)
+        x.view(-1)[0], x.view(-1)[-1] = lo, hi
+        x[M // 2] = hi  # a row and a column at the extremes
+        w = torch.randint(-128, 128, (N, K), generator=gen, dtype=torch.int64)
+        w[N // 2] = -128
+        bias = torch.randint(-1000, 1000, (N,), generator=gen, dtype=torch.int64) + big
+        acc = (x - izp) @ (w - wzp).t() + bias
+        olo, ohi = RANGE[out_dt]
+        bad = (acc < olo) | (acc > ohi)
+        want = acc.clamp(olo, ohi) if out_dt == "INT48" else ((acc + 2**31) % 2**32) - 2**31
+        for parts in (1, 4):
+            cbuf = torch.zeros(8, dtype=torch.int64, device="cuda")
+            got = linear(x.to(STORE[dt]).cuda(), w.to(torch.int8).cuda(), bias.cuda(), w.sum(1).cuda(), STORE[out_dt],
+                         izp, wzp, olo, ohi, out_dt == "INT48", cbuf, 2, parts)
+            ok = bool(torch.equal(got.cpu().to(torch.int64), want)) and got.dtype == STORE[out_dt] \
+                and cbuf.cpu().tolist() == [0, 0] + bad.reshape(parts, -1).sum(1).tolist() + [0] * (6 - parts)
+            rows.append(("synthetic", "-", ("CONV2D 1x1", dt, (M, K, N), f"zp {izp} {wzp}"),
+                         f"{parts} parts, {int(bad.sum())} REQUIRE failures", ok))
     return rows
 
 
@@ -142,7 +180,7 @@ def matmul_rows(gen):
 
 def main(specs):
     gen = torch.Generator().manual_seed(0)
-    rows = matmul_rows(gen)
+    rows = matmul_rows(gen) + linear_rows(gen)
     for spec in specs:
         name, path = spec.split("=", 1)
         rows += rescale_rows(name, path, 3, gen)

@@ -5,6 +5,8 @@ Covers single rounding with signed input and output, one (multiplier, shift) pai
 last dimension), apply_scale_32 and apply_scale_16. The register never leaves int64: |value| < 2^48 with a multiplier
 below 2^15 (apply_scale_16) or |value| <= 2^32 with a multiplier below 2^31 (apply_scale_32), plus a rounding term of
 at most 2^61 (shift <= 62).
+
+REQUIRE counts are added into two rows of the run's counter buffer (int64 [rows, samples]); see Emulator._slots.
 """
 import torch
 import triton
@@ -14,11 +16,11 @@ BLOCK = 1024
 
 
 @triton.jit
-def _rescale(x_ptr, y_ptr, c0_ptr, c1_ptr, m_ptr, s_ptr, n_per, nb, C, izp, m, s, ozp, olo, ohi,
+def _rescale(x_ptr, y_ptr, c_ptr, m_ptr, s_ptr, n_per, c0, c1, C, izp, m, s, ozp, olo, ohi,
              SCALE32: tl.constexpr, PER_CHANNEL: tl.constexpr, BLOCK: tl.constexpr):
-    """one block of one sample. c0 counts the elements that fail the first REQUIRE (SCALE32: the value entering
-    apply_scale_32 outside [-2^(shift-1), 2^(shift-1)); else the result of apply_scale_16 outside INT32), c1 the
-    elements whose result + output_zp is outside INT32."""
+    """one block of one sample. Counter c0: the elements that fail the first REQUIRE (SCALE32: the value entering
+    apply_scale_32 outside [-2^(shift-1), 2^(shift-1)); else the result of apply_scale_16 outside INT32); counter c1:
+    the elements whose result + output_zp is outside INT32."""
     pid = tl.program_id(0)
     sid = tl.program_id(1)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
@@ -43,25 +45,25 @@ def _rescale(x_ptr, y_ptr, c0_ptr, c1_ptr, m_ptr, s_ptr, n_per, nb, C, izp, m, s
     bad1 = (r < -2147483648) | (r > 2147483647)
     r = tl.minimum(tl.maximum(r, olo), ohi)
     tl.store(y_ptr + g, r.to(y_ptr.dtype.element_ty), mask=mask)
-    tl.store(c0_ptr + sid * nb + pid, tl.sum((bad0 & mask).to(tl.int32), axis=0))
-    tl.store(c1_ptr + sid * nb + pid, tl.sum((bad1 & mask).to(tl.int32), axis=0))
+    n0 = tl.sum((bad0 & mask).to(tl.int64), axis=0)
+    n1 = tl.sum((bad1 & mask).to(tl.int64), axis=0)
+    if n0 > 0:
+        tl.atomic_add(c_ptr + c0 + sid, n0)
+    if n1 > 0:
+        tl.atomic_add(c_ptr + c1 + sid, n1)
 
 
-def rescale(x, out_dtype, mult, shift, izp, ozp, olo, ohi, scale32, per_channel, samples=1):
+def rescale(x, out_dtype, mult, shift, izp, ozp, olo, ohi, scale32, per_channel, cbuf, c0, c1, parts=1):
     """x: contiguous CUDA tensor. mult / shift: python ints, or (per_channel) int64 CUDA tensors of x.shape[-1] values.
-    samples: x is split into this many equal parts in index order and the REQUIRE counts are given per part.
-    Returns (y, c0, c1): y of x's shape and out_dtype, c0 / c1 int64 tensors of `samples` counts."""
-    n = x.numel()
-    n_per = n // samples
-    nb = triton.cdiv(n_per, BLOCK)
+    parts: x is split into this many equal parts in index order; part p adds its REQUIRE counts to the flat elements
+    c0 + p and c1 + p of cbuf (int64). Returns y of x's shape and out_dtype."""
+    n_per = x.numel() // parts
     y = torch.empty(x.shape, dtype=out_dtype, device=x.device)
-    c0 = torch.empty((samples, nb), dtype=torch.int32, device=x.device)
-    c1 = torch.empty((samples, nb), dtype=torch.int32, device=x.device)
     if per_channel:
         m_t, s_t, m, s, C = mult, shift, 0, 0, x.shape[-1]
     else:
-        m_t = s_t = c0  # not read
+        m_t = s_t = cbuf  # not read
         m, s, C = mult, shift, 1
-    _rescale[(nb, samples)](x, y, c0, c1, m_t, s_t, n_per, nb, C, izp, m, s, ozp, olo, ohi,
-                            SCALE32=scale32, PER_CHANNEL=per_channel, BLOCK=BLOCK)
-    return y, c0.sum(1), c1.sum(1)
+    _rescale[(triton.cdiv(n_per, BLOCK), parts)](x, y, cbuf, m_t, s_t, n_per, c0, c1, C, izp, m, s, ozp, olo, ohi,
+                                                 SCALE32=scale32, PER_CHANNEL=per_channel, BLOCK=BLOCK)
+    return y
