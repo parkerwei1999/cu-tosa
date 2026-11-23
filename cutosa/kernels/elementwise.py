@@ -17,12 +17,15 @@ import torch
 import triton
 import triton.language as tl
 
+from ._launch import jit
+
 BLOCK = 1024
 ADD, SUB, MUL = 0, 1, 2
 
 
-@triton.jit
-def _binary(a_ptr, b_ptr, y_ptr, c_ptr, n_per, c0, ia, na, ib, nb_b, shift, lo, hi,
+@jit
+def _binary(a_ptr, b_ptr, y_ptr, c_ptr, n_per: tl.int64, c0: tl.int64, ia: tl.int64, na: tl.int64, ib: tl.int64,
+            nb_b: tl.int64, shift: tl.int64, lo: tl.int64, hi: tl.int64,
             OP: tl.constexpr, A_FLAT: tl.constexpr, B_FLAT: tl.constexpr, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
     sid = tl.program_id(1)
@@ -98,13 +101,13 @@ def binary(op, a, b, out_dtype, lo, hi, cbuf, c0, shift=0, parts=1):
     a, ia, na, a_flat = _operand(a, shape)
     b, ib, nb_b, b_flat = _operand(b, shape)
     y = torch.empty(shape, dtype=out_dtype, device=a.device)
-    _binary[(triton.cdiv(n_per, BLOCK), parts)](a, b, y, cbuf, n_per, c0, ia, na, ib, nb_b, shift, lo, hi,
-                                                OP=op, A_FLAT=a_flat, B_FLAT=b_flat, BLOCK=BLOCK)
+    _binary.launch((triton.cdiv(n_per, BLOCK), parts), (a, b, y, cbuf, n_per, c0, ia, na, ib, nb_b, shift, lo, hi),
+                   (op, a_flat, b_flat, BLOCK))
     return y
 
 
-@triton.jit
-def _table(x_ptr, t_ptr, y_ptr, n, WIDE: tl.constexpr, BLOCK: tl.constexpr):
+@jit
+def _table(x_ptr, t_ptr, y_ptr, n: tl.int64, WIDE: tl.constexpr, BLOCK: tl.constexpr):
     """TABLE. WIDE: INT16 input, 513 INT16 entries, INT32 output = entry * 128 + slope * fraction (9-bit index, 7-bit
     fraction). Else: INT8 input, 256 INT8 entries."""
     offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
@@ -124,12 +127,13 @@ def table(x, tab, out_dtype, wide):
     x = x.contiguous()
     n = x.numel()
     y = torch.empty(x.shape, dtype=out_dtype, device=x.device)
-    _table[(triton.cdiv(n, BLOCK),)](x, tab, y, n, WIDE=wide, BLOCK=BLOCK)
+    _table.launch((triton.cdiv(n, BLOCK),), (x, tab, y, n), (wide, BLOCK))
     return y
 
 
-@triton.jit
-def _reduce_sum(x_ptr, y_ptr, c_ptr, n_per, c0, L, inner, lo, hi, BLOCK: tl.constexpr):
+@jit
+def _reduce_sum(x_ptr, y_ptr, c_ptr, n_per: tl.int64, c0: tl.int64, L: tl.int64, inner: tl.int64, lo: tl.int64,
+                hi: tl.int64, BLOCK: tl.constexpr):
     """sum over one axis of length L that is not the last (inner = the element count of the dimensions after it): the
     lanes of a block are neighbours in memory. The REQUIRE of TOSA is on every running sum in index order, so the sum
     runs sequentially; an output element counts once if any of its running sums is outside [lo, hi]. The low bits of
@@ -139,7 +143,6 @@ def _reduce_sum(x_ptr, y_ptr, c_ptr, n_per, c0, L, inner, lo, hi, BLOCK: tl.cons
     offs = pid.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)  # int64 flat indices throughout
     mask = offs < n_per
     j = sid.to(tl.int64) * n_per + offs
-    inner = inner.to(tl.int64)
     base = (j // inner) * (L * inner) + (j % inner)
     acc = tl.zeros((BLOCK,), dtype=tl.int64)
     bad = tl.zeros((BLOCK,), dtype=tl.int64)
@@ -152,8 +155,9 @@ def _reduce_sum(x_ptr, y_ptr, c_ptr, n_per, c0, L, inner, lo, hi, BLOCK: tl.cons
         tl.atomic_add(c_ptr + c0 + sid, n0)
 
 
-@triton.jit
-def _reduce_sum_last(x_ptr, y_ptr, c_ptr, n_per, c0, L, lo, hi, BJ: tl.constexpr, BK: tl.constexpr):
+@jit
+def _reduce_sum_last(x_ptr, y_ptr, c_ptr, n_per: tl.int64, c0: tl.int64, L: tl.int64, lo: tl.int64, hi: tl.int64,
+                     BJ: tl.constexpr, BK: tl.constexpr):
     """the same over the last axis: a tile of BJ outputs x BK elements is read along the axis, and its running sums
     are the carried sum plus a cumulative sum inside the tile. A padded element adds 0, which repeats a running sum
     that exists."""
@@ -186,8 +190,11 @@ def reduce_sum(x, axis, out_dtype, lo, hi, cbuf, c0, parts=1):
     n_per = math.prod(shape) // parts
     y = torch.empty(shape, dtype=out_dtype, device=x.device)
     if inner == 1:
-        BJ, BK = 64, 32
-        _reduce_sum_last[(triton.cdiv(n_per, BJ), parts)](x, y, cbuf, n_per, c0, L, lo, hi, BJ=BJ, BK=BK)
+        # one tile spans the axis when it can (up to 1024 elements) and a program takes about 2048 elements: 228 sums
+        # over 1024 elements take 8 us this way and 186 us as 4 programs of 64 x 32 tiles walking the axis
+        BK = min(max(32, triton.next_power_of_2(L)), 1024)
+        BJ = max(2, 2048 // BK)
+        _reduce_sum_last.launch((triton.cdiv(n_per, BJ), parts), (x, y, cbuf, n_per, c0, L, lo, hi), (BJ, BK))
     else:
-        _reduce_sum[(triton.cdiv(n_per, BLOCK), parts)](x, y, cbuf, n_per, c0, L, inner, lo, hi, BLOCK=BLOCK)
+        _reduce_sum.launch((triton.cdiv(n_per, BLOCK), parts), (x, y, cbuf, n_per, c0, L, inner, lo, hi), (BLOCK,))
     return y

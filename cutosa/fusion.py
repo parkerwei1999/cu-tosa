@@ -1,6 +1,6 @@
 """Fusion plan: which operators of a graph run as one kernel.
 
-A unit is a tree of pointwise operators (RESCALE, ADD, SUB, MUL, TABLE, MINIMUM, MAXIMUM, GREATER, GREATER_EQUAL,
+A unit is one pointwise operator or a tree of them (RESCALE, ADD, SUB, MUL, TABLE, MINIMUM, MAXIMUM, GREATER, GREATER_EQUAL,
 SELECT, with RESHAPE between them) that ends in one root: every other member's output is read once, by a member of
 the same unit, and has as many elements as the root's output, so one pass over the root's flat index computes them
 all in registers and only the root's output is stored. The leaves (tensors read from outside the unit) may broadcast.
@@ -11,7 +11,7 @@ import math
 
 import numpy as np
 
-from .int64_ref import RANGE, ROUND_SINGLE
+from .int64_ref import ROUND_SINGLE
 
 POINTWISE = ("RESCALE", "ADD", "SUB", "MUL", "TABLE", "MINIMUM", "MAXIMUM", "GREATER", "GREATER_EQUAL", "SELECT")
 DATA_IN = {"RESCALE": 1, "ADD": 2, "SUB": 2, "MUL": 2, "TABLE": 1, "MINIMUM": 2, "MAXIMUM": 2, "GREATER": 2,
@@ -59,24 +59,23 @@ def eligible(g, o):
         sig = (g.dtype(o.inputs[0]), g.dtype(o.inputs[1]), out_dt, None if tab is None else tab.size)
         if sig == ("INT8", "INT8", "INT8", 256):
             return True
-        if sig != ("INT16", "INT16", "INT32", 513):
-            return False
-        slope = np.diff(tab.reshape(-1).astype(np.int64))
-        return not ((slope < RANGE["INT16"][0]) | (slope > RANGE["INT16"][1])).any()
+        return sig == ("INT16", "INT16", "INT32", 513)  # a slope outside INT16 is counted by the unit's kernel
     return True  # MINIMUM, MAXIMUM, GREATER, GREATER_EQUAL, SELECT
 
 
 class Unit:
-    """members: the operators in graph order, the root last. leaves: [(tensor name, the shape it is read with)] in
-    first-use order. alias: tensor -> the tensor it is a RESHAPE of (inside the unit)."""
+    """members: the operators in graph order, the root last. reshapes: the RESHAPEs between members. leaves:
+    [(index of the member that reads it, tensor name)] for the tensors read from outside the unit. key: the member
+    indices (what everything derived from the unit depends on)."""
 
     def __init__(self, root):
-        self.root, self.members, self.reshapes, self.leaves = root, [root], [], []
+        self.root, self.members, self.reshapes, self.leaves, self.key = root, [root], [], [], None
 
 
 def plan(g, keep=()):
-    """-> (units: {root op index: Unit} for units of at least 2 operators, absorbed: {op index: root op index} for
-    every non-root member and every RESHAPE inside a unit). Tensors in `keep` and the graph outputs stay stored."""
+    """-> (units: {root op index: Unit}, absorbed: {op index: root op index} for every non-root member and every
+    RESHAPE inside a unit). Every eligible operator that reads data is in exactly one unit, alone if nothing can join
+    it. Tensors in `keep` and the graph outputs stay stored."""
     producer, consumers = {}, {}
     for o in g.ops:
         for n in o.outputs:
@@ -122,9 +121,8 @@ def plan(g, keep=()):
                 u.members.append(p)
                 u.reshapes += chain
                 todo.append(p)
-        if len(u.members) < 2:
-            continue
         u.members.sort(key=lambda m: m.idx)
+        u.key = ("unit", *[m.idx for m in u.members])
         inside = {m.outputs[0] for m in u.members} | {r.outputs[0] for r in u.reshapes}
         for m in u.members:
             for n in m.inputs[:DATA_IN[m.op]]:

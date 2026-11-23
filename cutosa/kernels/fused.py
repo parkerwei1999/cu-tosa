@@ -7,7 +7,7 @@ A unit's kernel is generated from its structure, a hashable `prog`:
     ops: per member, in graph order, (kind, flags, operand refs); a ref is "L<k>" (leaf k) or "V<j>" (member j)
         ("RESCALE", (scale32, per_channel), (x,))
         ("ADD" | "SUB" | "MUL", (bits of the output type,), (a, b))
-        ("TABLE", (wide,), (x,))
+        ("TABLE", (wide, slope_check), (x,))      slope_check: the table has a slope outside INT16 (a REQUIRE)
         ("MINIMUM" | "MAXIMUM" | "GREATER" | "GREATER_EQUAL", (), (a, b))
         ("SELECT", (), (condition, a, b))
 The numbers of a unit (zero points, multipliers, shifts, bounds, broadcast strides) are not in the structure: they
@@ -15,9 +15,10 @@ are read from an int64 parameter tensor, laid out by params() in the order the g
     per "i" leaf: inner, n
     RESCALE with one multiplier: izp, multiplier, shift, ozp, olo, ohi;  per channel: izp, ozp, olo, ohi, C
     ADD / SUB: lo, hi        MUL: shift, lo, hi
-Tensor arguments after the leaves, in member order: TABLE: the table; RESCALE per channel: multipliers, shifts (int64).
-REQUIRE counters, in member order: RESCALE 2, ADD / SUB / MUL 1; counter k of sample s is the element
-cbase + k * cstride + s of the counter buffer.
+Tensor arguments after the leaves: the tables of the TABLEs in member order, then (multipliers, shifts), int64, of
+the per-channel RESCALEs in member order.
+REQUIRE counters, in member order: RESCALE 2, ADD / SUB / MUL 1, TABLE with slope_check 1; counter k of sample s is
+the element cbase + k * cstride + s of the counter buffer.
 
 Every register is int64. A stored ADD / SUB / MUL result is the low bits of the exact value (the reference model's
 wrap), so the register is truncated the same way before the next member reads it; RESCALE clamps and TABLE cannot
@@ -29,15 +30,18 @@ import linecache
 import triton
 import triton.language as tl
 
+from ._launch import jit
+
 BLOCK = 1024
 N_PARAMS = {"RESCALE": lambda f: 5 if f[1] else 6, "ADD": lambda f: 2, "SUB": lambda f: 2, "MUL": lambda f: 3}
-N_COUNTERS = {"RESCALE": 2, "ADD": 1, "SUB": 1, "MUL": 1}
+N_COUNTERS = {"RESCALE": lambda f: 2, "ADD": lambda f: 1, "SUB": lambda f: 1, "MUL": lambda f: 1,
+              "TABLE": lambda f: int(f[1])}
 _INT = {8: "tl.int8", 16: "tl.int16", 32: "tl.int32"}
 _kernels = {}
 
 
 def n_counters(prog):
-    return sum(N_COUNTERS.get(kind, 0) for kind, _, _ in prog[1])
+    return sum(N_COUNTERS[kind](flags) for kind, flags, _ in prog[1] if kind in N_COUNTERS)
 
 
 def n_params(prog):
@@ -48,8 +52,9 @@ def source(prog, name):
     modes, ops = prog
     aux = [f"t{j}_ptr" for j, (k, f, _) in enumerate(ops) if k == "TABLE"] \
         + [a for j, (k, f, _) in enumerate(ops) if k == "RESCALE" and f[1] for a in (f"m{j}_ptr", f"s{j}_ptr")]
-    args = ["y_ptr", "c_ptr", "p_ptr", "n_per", "cbase", "cstride"] + [f"x{k}_ptr" for k in range(len(modes))] + aux
-    L = ["@triton.jit",
+    args = ["y_ptr", "c_ptr", "p_ptr"] + [f"x{k}_ptr" for k in range(len(modes))] + aux \
+        + ["n_per: tl.int64", "cbase: tl.int64", "cstride: tl.int64"]
+    L = ["@jit",
          f"def {name}({', '.join(args)}, BLOCK: tl.constexpr):",
          "    pid = tl.program_id(0)",
          "    sid = tl.program_id(1)",
@@ -82,8 +87,8 @@ def source(prog, name):
             if per_channel:
                 izp, ozp, olo, ohi, C = par(), par(), par(), par(), par()
                 L.append(f"    ch{j} = g % {C}")
-                L.append(f"    mm{j} = tl.load(m{j}_ptr + ch{j}, mask=mask, other=0)")
-                L.append(f"    ss{j} = tl.load(s{j}_ptr + ch{j}, mask=mask, other=2)")
+                L.append(f"    mm{j} = tl.load(m{j}_ptr + ch{j}, mask=mask, other=0).to(tl.int64)")
+                L.append(f"    ss{j} = tl.load(s{j}_ptr + ch{j}, mask=mask, other=2).to(tl.int64)")
             else:
                 izp, m, s, ozp, olo, ohi = par(), par(), par(), par(), par(), par()
                 L.append(f"    mm{j} = one * {m}")
@@ -112,6 +117,8 @@ def source(prog, name):
                 L.append(f"    b{j} = tl.load(t{j}_ptr + i{j}, mask=mask, other=0).to(tl.int64)")
                 L.append(f"    e{j} = tl.load(t{j}_ptr + i{j} + 1, mask=mask, other=0).to(tl.int64)")
                 L.append(f"    {v} = b{j} * 128 + (e{j} - b{j}) * ({x} & 127)")
+                if flags[1]:
+                    count(f"(e{j} - b{j} < -32768) | (e{j} - b{j} > 32767)")
             else:
                 L.append(f"    {v} = tl.load(t{j}_ptr + {x} + 128, mask=mask, other=0).to(tl.int64)")
         elif kind in ("MINIMUM", "MAXIMUM"):
@@ -136,11 +143,12 @@ def kernel(prog):
         src = source(prog, name)
         filename = f"<cutosa {name}>"
         linecache.cache[filename] = (len(src), None, src.splitlines(True), filename)  # for inspect.getsource
-        ns = {"triton": triton, "tl": tl}
+        ns = {"jit": jit, "tl": tl}
         exec(compile(src, filename, "exec"), ns)
         fn = _kernels[prog] = ns[name]
     return fn
 
 
-def launch(prog, y, cbuf, params, n_per, parts, cbase, cstride, leaves, aux):
-    kernel(prog)[(triton.cdiv(n_per, BLOCK), parts)](y, cbuf, params, n_per, cbase, cstride, *leaves, *aux, BLOCK=BLOCK)
+def launch(k, types, y, cbuf, params, n_per, parts, cbase, cstride, leaves, aux):
+    """k: kernel(prog). types: the element types of (y, cbuf, params, *leaves, *aux)."""
+    k.launch((triton.cdiv(n_per, BLOCK), parts), (y, cbuf, params, *leaves, *aux, n_per, cbase, cstride), (BLOCK,), types)

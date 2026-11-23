@@ -132,7 +132,7 @@ def unit_rows(name, path, per_struct, gen):
     """fusion units (cutosa/fusion.py): real units, grouped by kernel structure, with their leaves drawn over the
     whole declared range, over 3/4 of it and over small values; the generated kernel against the int64 emulator's
     operators applied member by member. Each also runs as several samples when a sample count divides every member."""
-    from cutosa.fusion import DATA_IN, plan
+    from cutosa.fusion import plan
     g = TosaGraphIR(path)
     ref, cu = Int64Emulator(g, device="cuda"), Emulator(g, device="cuda")
     units, _ = plan(g)
@@ -172,8 +172,8 @@ def unit_rows(name, path, per_struct, gen):
                 wc = [(i, m_, c.tolist()) for i, _, m_, c in ref._pending]
                 gc = [(i, m_, c) for i, _, m_, c in cu._slot_records()]
                 nz = lambda rs: sorted((i, m_, c) for i, m_, c in rs if (any(c) if isinstance(c, list) else c))
-                ok = bool(torch.equal(got[0].to(torch.int64), want)) and nz(wc) == nz(gc) \
-                    and got[0].dtype == STORE[g.dtype(u.root.outputs[0])]
+                ok = bool(torch.equal(got.to(torch.int64), want)) and nz(wc) == nz(gc) \
+                    and got.dtype == STORE[g.dtype(u.root.outputs[0])]
                 nbad = sum(sum(c) if isinstance(c, list) else c for _, _, c in wc)
                 rows.append((name, u.root.idx, label, f"{draw}{f' x{samples}' if samples > 1 else ''}, "
                              f"{want.numel()} el, {nbad} REQUIRE failures in {len(nz(wc))} records", ok))

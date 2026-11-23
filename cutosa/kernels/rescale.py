@@ -12,11 +12,14 @@ import torch
 import triton
 import triton.language as tl
 
+from ._launch import jit
+
 BLOCK = 1024
 
 
-@triton.jit
-def _rescale(x_ptr, y_ptr, c_ptr, m_ptr, s_ptr, n_per, c0, c1, C, izp, m, s, ozp, olo, ohi,
+@jit
+def _rescale(x_ptr, y_ptr, c_ptr, m_ptr, s_ptr, n_per: tl.int64, c0: tl.int64, c1: tl.int64, C: tl.int64,
+             izp: tl.int64, m: tl.int64, s: tl.int64, ozp: tl.int64, olo: tl.int64, ohi: tl.int64,
              SCALE32: tl.constexpr, PER_CHANNEL: tl.constexpr, BLOCK: tl.constexpr):
     """one block of one sample. Counter c0: the elements that fail the first REQUIRE (SCALE32: the value entering
     apply_scale_32 outside [-2^(shift-1), 2^(shift-1)); else the result of apply_scale_16 outside INT32); counter c1:
@@ -64,6 +67,6 @@ def rescale(x, out_dtype, mult, shift, izp, ozp, olo, ohi, scale32, per_channel,
     else:
         m_t = s_t = cbuf  # not read
         m, s, C = mult, shift, 1
-    _rescale[(triton.cdiv(n_per, BLOCK), parts)](x, y, cbuf, m_t, s_t, n_per, c0, c1, C, izp, m, s, ozp, olo, ohi,
-                                                 SCALE32=scale32, PER_CHANNEL=per_channel, BLOCK=BLOCK)
+    _rescale.launch((triton.cdiv(n_per, BLOCK), parts), (x, y, cbuf, m_t, s_t, n_per, c0, c1, C, izp, m, s, ozp, olo, ohi),
+                    (scale32, per_channel, BLOCK))
     return y

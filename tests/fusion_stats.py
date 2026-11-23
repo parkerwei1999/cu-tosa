@@ -27,12 +27,12 @@ for spec in sys.argv[1:]:
                      + ":" + g.dtype(m.outputs[0]))
         sig[tuple(s)] += 1
     allsig.update(sig)
-    solo = Counter(o.op for o in after if o.idx not in units)
+    solo = Counter(o.op for o in after if o.idx not in units or len(units[o.idx].members) == 1)
     print(f"{name}: {len(ops)} operators, kernel launches {len(launch)} -> {len(after)} "
           f"({len(launch) / len(after):.2f}x fewer), pointwise bytes stored {stored([o for o in launch if o.op in POINTWISE]) / 2**20:.0f}"
           f" -> {stored([o for o in after if o.op in POINTWISE]) / 2**20:.0f} MiB")
     print(f"   {len(units)} units, {len(sig)} structures, sizes {dict(sorted(sizes.items()))}")
-    print(f"   launches left outside units: {dict(solo.most_common(8))}")
+    print(f"   launches of one operator: {dict(solo.most_common(8))}")
 print(f"all graphs: {len(allsig)} distinct unit structures; most common:")
 for s, n in allsig.most_common(6):
     print(f"   {n:5d} x {' '.join(s)}")

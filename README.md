@@ -21,12 +21,19 @@ Tensors are stored at their TOSA type (INT8 / INT16 / INT32 natively, INT48 in i
 | as stored | MINIMUM, MAXIMUM, SELECT, CLAMP, REDUCE_MAX, TRANSPOSE, RESHAPE, SLICE, CONCAT | the int64 emulator's method on the stored tensors (the result does not depend on the width) |
 | fallback | other CONV2D, MATMUL of other types, and any attribute combination a kernel declines (double rounding, unsigned RESCALE, a TABLE whose slope REQUIRE can fail) | widen to int64, run the int64 emulator's method, narrow |
 
-On top of that, trees of pointwise operators (RESCALE, ADD, SUB, MUL, TABLE, MINIMUM, MAXIMUM, GREATER,
-GREATER_EQUAL, SELECT, with RESHAPE between them) run as one generated kernel each (`cutosa/fusion.py` plans the
-units, `cutosa/kernels/fused.py` generates a kernel per unit structure): the members are computed in registers,
-every member's REQUIREs are still counted, and only the root's result is stored. `Emulator(fuse=False)` turns it off.
+With fusion (the default; `Emulator(fuse=False)` turns it off) the pointwise operators (RESCALE, ADD, SUB, MUL,
+TABLE, MINIMUM, MAXIMUM, GREATER, GREATER_EQUAL, SELECT) that read data do not run one by one: `cutosa/fusion.py`
+groups them into units, each a tree of such operators (RESHAPE allowed between them) whose inner results are read
+once and have the root's element count, or a single operator when nothing can join it. A unit runs as one generated
+kernel (`cutosa/kernels/fused.py`, one kernel per unit structure): the members are computed in 64-bit registers,
+every member's REQUIREs are still counted (a TABLE slope outside INT16 included), and only the root's result is
+stored. Without fusion the table above applies to every operator.
 
-`Emulator.how` records the path of every operator of the last run (`fused` for the members of a unit). On a CPU device the whole run is the int64 emulator.
+Kernels are launched through `cutosa/kernels/_launch.py`, which keeps the compiled kernel per element types and calls
+Triton's launcher directly; it follows the Triton versions listed there and uses Triton's own path with any other.
+
+`Emulator.how` records the path of every operator of the last run (`fused` for the members of a unit). On a CPU
+device the whole run is the int64 emulator.
 
 ## Limits
 
@@ -45,6 +52,7 @@ These stop a run with an exception; none gives a wrong result.
 PYTHONPATH=. python tests/kernel_check.py name=graph.tosa ...     # each kernel against the int64 emulator's operator
 PYTHONPATH=. python tests/graph_equiv.py name=graph.tosa ...      # whole graphs, bit for bit, with timing
 tests/run_ut_vs_reference.sh <tosa_emu_op_check.py> graph.tosa ...  # operator instances against tosa_reference_model
+PYTHONPATH=. python tests/fusion_cases.py                         # fusion on synthetic and random graphs
 PYTHONPATH=. python tests/fusion_stats.py name=graph.tosa ...     # what the fusion plan removes
 PYTHONPATH=. python tests/big_index_check.py                      # flat indices beyond 2^31 (5 GiB of GPU memory)
 PYTHONPATH=. python tests/profile_ops.py name=graph.tosa ...      # time per operator and path

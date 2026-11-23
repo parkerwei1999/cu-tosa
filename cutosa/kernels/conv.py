@@ -12,11 +12,14 @@ import torch
 import triton
 import triton.language as tl
 
+from ._launch import jit
+
 MAX_K = 65280  # the int32 row sums of an INT16 input (proofs/limb_proof.py)
 
 
-@triton.jit
-def _linear(x_ptr, w_ptr, y_ptr, c_ptr, bias_ptr, wsum_ptr, M_per, N, K, c0, izp, wzp, lo, hi,
+@jit
+def _linear(x_ptr, w_ptr, y_ptr, c_ptr, bias_ptr, wsum_ptr, M_per: tl.int64, N: tl.int64, K: tl.int64, c0: tl.int64,
+            izp: tl.int64, wzp: tl.int64, lo: tl.int64, hi: tl.int64,
             WIDE: tl.constexpr, SAT: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
     pid_m, pid_n, sid = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     rm = pid_m * BM + tl.arange(0, BM)
@@ -75,7 +78,7 @@ def linear(x, w, bias64, wsum64, out_dtype, izp, wzp, lo, hi, saturate, cbuf, c0
     y = torch.empty((M, N), dtype=out_dtype, device=x.device)
     M_per = M // parts
     BM, BN, BK = 64, 64, 32
-    _linear[(triton.cdiv(M_per, BM), triton.cdiv(N, BN), parts)](
-        x, w, y, cbuf, bias64, wsum64, M_per, N, K, c0, izp, wzp, lo, hi,
-        WIDE=x.dtype == torch.int16, SAT=saturate, BM=BM, BN=BN, BK=BK, num_stages=2)
+    _linear.launch((triton.cdiv(M_per, BM), triton.cdiv(N, BN), parts),
+                   (x, w, y, cbuf, bias64, wsum64, M_per, N, K, c0, izp, wzp, lo, hi),
+                   (x.dtype == torch.int16, saturate, BM, BN, BK), num_stages=2)
     return y

@@ -1,11 +1,13 @@
 """Flat indices beyond 2^31 (needs ~5 GiB of GPU memory): ADD of an int8 (N, 1) with an int8 (1, 1024), 2^31 + 1024
-output elements in one part, then RESCALE and REDUCE_SUM over that tensor, each against torch on slices.
+output elements in one part, then RESCALE and REDUCE_SUM over that tensor, each against torch on slices, and the
+generated kernel of the unit ADD + RESCALE against the two separate results.
 usage: python tests/big_index_check.py
 """
 import sys
 
 import torch
 
+from cutosa.kernels import fused
 from cutosa.kernels.elementwise import ADD, binary, reduce_sum
 from cutosa.kernels.rescale import rescale
 
@@ -32,7 +34,16 @@ for i in range(0, N, 2**16):
 ok &= cbuf[1:3].tolist() == [0, 0]
 print(f"{'ok  ' if ok else 'FAIL'} RESCALE over the same tensor")
 res.append(ok)
-del r
+
+prog = (("i", "i"), (("ADD", (8,), ("L0", "L1")), ("RESCALE", (True, False), ("V0",))))
+params = torch.tensor([C, N, 1, C, -128, 127, 3, 1 << 30, 31, -5, -128, 127, 0], dtype=torch.int64, device="cuda")
+cnt = torch.zeros(4, dtype=torch.int64, device="cuda")
+u = torch.empty((N, C), dtype=torch.int8, device="cuda")
+fused.launch(fused.kernel(prog), None, u, cnt, params, u.numel(), 1, 0, 1, [a.contiguous(), b.contiguous()], [])
+ok = all(bool(torch.equal(u[i:i + 2**16], r[i:i + 2**16])) for i in range(0, N, 2**16)) and cnt[:3].tolist() == [bad, 0, 0]
+print(f"{'ok  ' if ok else 'FAIL'} generated ADD + RESCALE kernel over the same elements")
+res.append(ok)
+del r, u
 
 for axis in (0, 1):
     cbuf.zero_()

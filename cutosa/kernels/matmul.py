@@ -11,6 +11,8 @@ import torch
 import triton
 import triton.language as tl
 
+from ._launch import jit
+
 MAX_K = 65280  # proofs/limb_proof.py: (2^31 - 1) // 32896
 BM, BN, BK = 64, 64, 32
 
@@ -21,8 +23,9 @@ def fits(Bn, M, K, N):
     return K <= MAX_K and Bn <= 65535 and triton.cdiv(N, BN) <= 65535 and max(Bn * M * K, Bn * K * N, Bn * M * N) < 2**31
 
 
-@triton.jit
-def _bmm_i16(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, scb, scm, scn,
+@jit
+def _bmm_i16(a_ptr, b_ptr, c_ptr, M: tl.int64, N: tl.int64, K: tl.int64, sab: tl.int64, sam: tl.int64, sak: tl.int64,
+             sbb: tl.int64, sbk: tl.int64, sbn: tl.int64, scb: tl.int64, scm: tl.int64, scn: tl.int64,
              BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
     """c[b, m, n] = sum_k a[b, m, k] * b[b, k, n], exact. A padded element loads 128: both limbs 0, x - 128 = 0."""
     pid_m, pid_n, pid_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -70,5 +73,5 @@ def bmm_i16(a, b):
                          f"for the int32 row sums, batch <= 65535, fewer than 2^31 elements)")
     c = torch.empty((Bn, M, N), dtype=torch.int64, device=a.device)
     grid = (triton.cdiv(M, BM), triton.cdiv(N, BN), Bn)
-    _bmm_i16[grid](a, b, c, M, N, K, *a.stride(), *b.stride(), *c.stride(), BM=BM, BN=BN, BK=BK, num_stages=2)
+    _bmm_i16.launch(grid, (a, b, c, M, N, K, *a.stride(), *b.stride(), *c.stride()), (BM, BN, BK), num_stages=2)
     return c

@@ -20,6 +20,8 @@ does. Both are read once at the end of run().
 
 Interface and results are those of int64_ref.Emulator: run(), violations, graph_status().
 """
+import math
+
 import numpy as np
 import torch
 
@@ -236,14 +238,17 @@ class Emulator(Int64Emulator):
 
     # -- fusion ------------------------------------------------------------------------------------------------------
     def _plan(self, keep, fuse):
-        """the plan of a run that keeps `keep`: (units, absorbed, free: {index of the operator after which tensors can
-        be dropped: [names]}). Without fusion: no units, and the int64 emulator's last uses."""
+        """the plan of a run that keeps `keep`, from the graph alone: (absorbed: the operators that run inside another
+        one's unit, steps: [(operator, its unit or None, whether it reads a tensor computed from the graph inputs,
+        the tensors to drop after it)] for the operators that run, in order). Without fusion: no units, and the int64
+        emulator's last uses."""
         key = (fuse, frozenset(keep))
         if key not in self._plans:
             from .fusion import plan
-            units, absorbed = plan(self.g, keep) if fuse else ({}, {})
+            g = self.g
+            units, absorbed = plan(g, keep) if fuse else ({}, {})
             last = {}
-            for o in self.g.ops:
+            for o in g.ops:
                 at = absorbed.get(o.idx, o.idx)  # a member's inputs are read when its root runs
                 for n in o.inputs:
                     last[n] = max(last.get(n, -1), at)
@@ -251,7 +256,16 @@ class Emulator(Int64Emulator):
             for n, i in last.items():
                 if n not in keep and n not in self.consts:
                     free.setdefault(i, []).append(n)
-            self._plans[key] = (units, absorbed, free)
+            from_inputs, steps = set(g.inputs), []
+            for o in g.ops:
+                if o.op in ("CONST", "CONST_SHAPE"):
+                    continue
+                reads = any(n in from_inputs for n in o.inputs)
+                if reads:
+                    from_inputs.update(o.outputs)
+                if o.idx not in absorbed:
+                    steps.append((o, units.get(o.idx), reads, tuple(free.get(o.idx, ()))))
+            self._plans[key] = (absorbed, steps)
         return self._plans[key]
 
     def _unit_prep(self, u):
@@ -303,46 +317,66 @@ class Emulator(Int64Emulator):
                 tail += [max(shift, 0) if g.dtype(m.inputs[0]) == "INT32" else 0, *RANGE[out_dt]]
                 checks.append((m, f"MUL result (shift {shift}) outside {out_dt}"))
             elif m.op == "TABLE":
-                flags = (g.dtype(m.inputs[0]) == "INT16",)
+                wide = g.dtype(m.inputs[0]) == "INT16"
+                slope = np.diff(self._host(m.inputs[1]).reshape(-1)) if wide else np.zeros(1, np.int64)
+                flags = (wide, bool(((slope < RANGE["INT16"][0]) | (slope > RANGE["INT16"][1])).any()))
+                if flags[1]:
+                    checks.append((m, "TABLE slope outside INT16"))
             ops.append((m.op, flags, tuple(refs)))
         # the tensor arguments in the kernel's order: tables first, then the per-channel pairs
         tables = [self.consts[m.inputs[1]].reshape(-1).contiguous() for m in u.members if m.op == "TABLE"]
+        aux = tables + aux
         prog = (tuple(modes), tuple(ops))
         params = torch.tensor(lead + tail + [0], dtype=torch.int64, device=self.device)  # + [0]: never empty
         assert params.numel() - 1 == fused.n_params(prog) and len(checks) == fused.n_counters(prog)
         root = u.members[-1].outputs[0]
-        return dict(prog=prog, params=params, leaves=leaves, aux=tables + aux, checks=checks,
-                    shape=g.tensors[root].shape, store=STORE[g.dtype(root)],
-                    shapes=[(m, g.tensors[m.outputs[0]].shape) for m in u.members])
+        store = STORE[g.dtype(root)]
+        # every tensor of a run is stored at STORE of its declared type (the run loop checks it), the constants as loaded
+        types = (store, torch.int64, torch.int64,
+                 *[self.consts[n].dtype if n in self.consts else STORE[g.dtype(n)] for n, _ in leaves],
+                 *[t.dtype for t in aux])
+        return dict(prog=prog, kernel=fused.kernel(prog), types=types, params=params, leaves=leaves, aux=aux,
+                    shape=g.tensors[root].shape, numel=math.prod(g.tensors[root].shape), store=store,
+                    shapes=list({m.idx: (m, g.tensors[m.outputs[0]].shape) for m, _ in checks}.values()), parts={},
+                    slots={per_part: [(m.idx, m.op, msg, per_part) for m, msg in checks] for per_part in (True, False)})
 
     def _run_unit(self, u, env):
-        """-> [the root's stored result], or None when the members do not split into the same sample parts (the unit
-        then runs operator by operator)."""
+        """-> the root's stored result, or None when the checked members do not split into the same sample parts (the
+        unit then runs operator by operator). A sample count that does not split a checked member raises as in the
+        int64 emulator, but when the root runs: an operator on its own between that member and the root may raise
+        first, so the operator named in the error can differ."""
         from .kernels import fused
-        prep = self._prep.get(("unit", u.root.idx))
+        prep = self._prep.get(u.key)  # by member set: a root has other members under another `keep`
         if prep is None:
-            prep = self._prep[("unit", u.root.idx)] = self._unit_prep(u)
-        self._from_inputs = True
-        parts = {self._parts(m, shape) for m, shape in prep["shapes"]}  # raises as the int64 emulator's check does
-        if len(parts) != 1:
+            prep = self._prep[u.key] = self._unit_prep(u)
+        mode = (self.samples, self.check)
+        parts = prep["parts"].get(mode, 0)
+        if parts == 0:  # shapes only: the same for every run of this mode
+            self._from_inputs = True
+            found = {self._parts(m, shape) for m, shape in prep["shapes"]}  # only the members with a REQUIRE split
+            parts = prep["parts"][mode] = 1 if not found else found.pop() if len(found) == 1 else None
+        if parts is None:
             return None
-        parts = parts.pop()
         if self.check:
-            cbase = len(self._slots) * self.samples
-            for m, msg in prep["checks"]:
-                self._slot(m, msg, parts)
-            cstride = self.samples
+            cbase, cstride = len(self._slots) * self.samples, self.samples
+            self._slots += prep["slots"][parts == self.samples]
         else:
             cbase, cstride = self._cbuf.numel() - self.samples, 0
         leaves = [env[n].contiguous() if shape is None else env[n].expand(shape).contiguous()
                   for n, shape in prep["leaves"]]
         y = torch.empty(prep["shape"], dtype=prep["store"], device=self.device)
-        fused.launch(prep["prog"], y, self._cbuf, prep["params"], y.numel() // parts, parts, cbase, cstride, leaves,
-                     prep["aux"])
-        return [y]
+        fused.launch(prep["kernel"], prep["types"], y, self._cbuf, prep["params"], prep["numel"] // parts, parts,
+                     cbase, cstride, leaves, prep["aux"])
+        return y
 
     def _exec(self, o, env, from_inputs):
         """one operator on its own: kernel, as stored, or fallback. -> (outputs, how)."""
+        if o.op == "RESHAPE":  # op_RESHAPE with its constant shape read once
+            shape = self._prep.get(o.idx)
+            if shape is None and (o.inputs[1] in self.g.shapes or self.g.tensors[o.inputs[1]].data is not None):
+                shape = self._prep[o.idx] = tuple(int(v) for v in self._host(o.inputs[1]))
+            if shape is not None:
+                return [env[o.inputs[0]].reshape(shape)], "stored"
         ref = getattr(self, "op_" + o.op, None)
         if ref is None:
             raise NotImplementedError(f"op {o.op} (#{o.idx})")
@@ -371,8 +405,7 @@ class Emulator(Int64Emulator):
             raise ValueError(f"graph has {len(g.inputs)} inputs, got {len(inputs)}")
         self._begin(samples)
         keep = set(keep) | set(g.outputs)
-        units, absorbed, free = self._plan(keep, self.fuse and not self.faults)  # a fault names any operator
-        from_inputs = set(g.inputs)
+        absorbed, steps = self._plan(keep, self.fuse and not self.faults)  # a fault names any operator
         env = dict(self.consts)
         for name, x in zip(g.inputs, inputs):
             t = torch.as_tensor(np.asarray(x)) if not isinstance(x, torch.Tensor) else x
@@ -381,42 +414,38 @@ class Emulator(Int64Emulator):
             if t.dtype != STORE[g.dtype(name)]:  # int64 first, as the int64 emulator reads it (any numpy integer type)
                 t = t.to(torch.int64)
             env[name] = self._narrow(name, t.to(self.device), always_verify=True)
-        reads = {}  # op index -> whether it reads a tensor computed from the graph inputs
-        for o in g.ops:
-            if o.op in ("CONST", "CONST_SHAPE"):
-                continue
-            reads[o.idx] = any(n in from_inputs for n in o.inputs)
-            if reads[o.idx]:
-                from_inputs.update(o.outputs)
-            if o.idx in absorbed:
-                self.how[o.idx] = "fused"
-                continue
-            u = units.get(o.idx)
-            outs = self._run_unit(u, env) if u is not None else None
-            if outs is not None:
-                how = "fused"
-            elif u is not None:  # the unit, operator by operator
-                for m in sorted(u.members[:-1] + u.reshapes, key=lambda m: m.idx):
-                    mo, self.how[m.idx] = self._exec(m, env, reads[m.idx])
-                    env.update(zip(m.outputs, mo))
-                outs, how = self._exec(o, env, reads[o.idx])
-                for m in u.members[:-1] + u.reshapes:
-                    env.pop(m.outputs[0], None)
+        how = self.how
+        how.update(dict.fromkeys(absorbed, "fused"))
+        for o, u, reads, drop in steps:
+            y = self._run_unit(u, env) if u is not None else None
+            if y is not None:  # one tensor of the declared shape and stored type by construction
+                how[o.idx] = "fused"
+                env[o.outputs[0]] = y
+                if hook is not None:
+                    hook(o, [y])
             else:
-                outs, how = self._exec(o, env, reads[o.idx])
-            self.how[o.idx] = how
-            if o.idx in self.faults:
-                outs = self.faults[o.idx](outs)
-            for n, t in zip(o.outputs, outs):
-                want = g.tensors[n].shape
-                if tuple(t.shape) != want:
-                    raise RuntimeError(f"#{o.idx} {o.op} -> {n}: shape {tuple(t.shape)} != declared {want}")
-                if t.dtype != STORE[g.dtype(n)]:
-                    raise RuntimeError(f"#{o.idx} {o.op} -> {n}: stored as {t.dtype}, want {STORE[g.dtype(n)]}")
-                env[n] = t
-            if hook is not None:
-                hook(o, outs)
-            for n in free.get(o.idx, ()):
+                if u is not None:  # the unit, operator by operator
+                    inner = sorted(u.members[:-1] + u.reshapes, key=lambda m: m.idx)
+                    for m in inner:
+                        mo, how[m.idx] = self._exec(m, env, True)
+                        env.update(zip(m.outputs, mo))
+                    outs, how[o.idx] = self._exec(o, env, reads)
+                    for m in inner:
+                        env.pop(m.outputs[0], None)
+                else:
+                    outs, how[o.idx] = self._exec(o, env, reads)
+                if o.idx in self.faults:
+                    outs = self.faults[o.idx](outs)
+                for n, t in zip(o.outputs, outs):
+                    want = g.tensors[n].shape
+                    if tuple(t.shape) != want:
+                        raise RuntimeError(f"#{o.idx} {o.op} -> {n}: shape {tuple(t.shape)} != declared {want}")
+                    if t.dtype != STORE[g.dtype(n)]:
+                        raise RuntimeError(f"#{o.idx} {o.op} -> {n}: stored as {t.dtype}, want {STORE[g.dtype(n)]}")
+                    env[n] = t
+                if hook is not None:
+                    hook(o, outs)
+            for n in drop:
                 env.pop(n, None)
         self.env = {n: env[n] for n in keep if n in env}
         records = self._slot_records()  # an operator is on one path, so its records keep their order in the sort
