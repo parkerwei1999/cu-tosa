@@ -1,0 +1,12 @@
+[project]
+name = "cutosa"
+version = "0.0.1"
+description = "Bit-exact GPU emulator of TOSA 1.0 integer graphs"
+requires-python = ">=3.10"
+dependencies = ["numpy", "torch", "triton", "tosa-tools"]
+
+[tool.setuptools]
+packages = ["cutosa", "cutosa.kernels"]
+
+[tool.ruff]
+line-length = 120
