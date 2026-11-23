@@ -1,8 +1,8 @@
 """Run the MLEK-Transformer kit's TOSA_TORCH backend on cu-tosa without editing the kit.
 
 With this directory first on PYTHONPATH and CUTOSA_KIT_OVERLAY=1, the kit module `tosa_exec.tosa_emu` gets its
-`Emulator` replaced by `cutosa.Emulator` as it loads, so `from .tosa_emu import Emulator` in tosa_backends.py binds
-the cu-tosa class (in spawned worker processes too: they inherit the environment). The kit's own class stays
+`Emulator` and `TosaGraphIR` replaced by cutosa's as it loads, so `from .tosa_emu import Emulator` in
+tosa_backends.py binds the cu-tosa class (in spawned worker processes too: they inherit the environment). The kit's own class stays
 available as `tosa_exec.tosa_emu.Int64Emulator`. Without the variable this file does nothing.
 
 Python imports one `sitecustomize` at startup; another one further down sys.path (Ubuntu ships one) is run from here.
@@ -31,6 +31,7 @@ class _Loader(importlib.abc.Loader):
         import cutosa
         module.Int64Emulator = module.Emulator
         module.Emulator = cutosa.Emulator
+        module.TosaGraphIR = cutosa.TosaGraphIR  # the class cutosa.Emulator recognises (the same code as the kit's)
         print(f"[cu-tosa overlay] {module.__name__}.Emulator -> cutosa.Emulator ({cutosa.__file__})", file=sys.stderr)
 
 
