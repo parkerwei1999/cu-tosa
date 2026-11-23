@@ -128,6 +128,58 @@ def replay_rows(name, path, per_sig, gen):
     return rows
 
 
+def unit_rows(name, path, per_struct, gen):
+    """fusion units (cutosa/fusion.py): real units, grouped by kernel structure, with their leaves drawn over the
+    whole declared range, over 3/4 of it and over small values; the generated kernel against the int64 emulator's
+    operators applied member by member. Each also runs as several samples when a sample count divides every member."""
+    from cutosa.fusion import DATA_IN, plan
+    g = TosaGraphIR(path)
+    ref, cu = Int64Emulator(g, device="cuda"), Emulator(g, device="cuda")
+    units, _ = plan(g)
+    groups = defaultdict(list)
+    for u in units.values():
+        groups[cu._unit_prep(u)["prog"]].append(u)
+    rows = []
+    for prog, us in sorted(groups.items(), key=str):
+        label = " ".join(k for k, _, _ in prog[1])
+        for u in us[:: max(1, len(us) // per_struct)][:per_struct]:
+            shapes = [g.tensors[m.outputs[0]].shape for m in u.members]
+            lead = [next((d for d in s_ if d != 1), 1) for s_ in shapes]
+            many = next((k for k in (4, 2, 3, 5) if all(d % k == 0 for d in lead)), None)
+            for draw in ("full", "3/4", "small") + (("3/4 samples",) if many else ()):
+                samples = many if draw.endswith("samples") else 1
+                wide, narrow = dict(ref.consts), dict(cu.consts)
+                for _, n in u.leaves:
+                    if n in wide:
+                        continue
+                    lo, hi = RANGE[g.dtype(n)] if g.dtype(n) != "BOOL" else (0, 1)
+                    if draw.startswith("3/4"):
+                        lo, hi = 3 * lo // 4, 3 * hi // 4
+                    elif draw == "small":
+                        lo, hi = max(lo, -1000), min(hi, 1000)
+                    x = torch.randint(lo, hi + 1, g.tensors[n].shape, generator=gen, dtype=torch.int64)
+                    if x.numel() > 1:
+                        x.view(-1)[0], x.view(-1)[-1] = lo, hi
+                    wide[n], narrow[n] = x.cuda(), x.to(STORE[g.dtype(n)]).cuda()
+                begin(ref, cu, samples)
+                for m in sorted(u.members + u.reshapes, key=lambda m: m.idx):
+                    wide[m.outputs[0]] = getattr(ref, "op_" + m.op)(m, *[wide.get(n) for n in m.inputs])[0]
+                want = wide[u.root.outputs[0]]
+                got = cu._run_unit(u, narrow)
+                if got is None:
+                    rows.append((name, u.root.idx, label, f"{draw}: not run as a unit", True))
+                    continue
+                wc = [(i, m_, c.tolist()) for i, _, m_, c in ref._pending]
+                gc = [(i, m_, c) for i, _, m_, c in cu._slot_records()]
+                nz = lambda rs: sorted((i, m_, c) for i, m_, c in rs if (any(c) if isinstance(c, list) else c))
+                ok = bool(torch.equal(got[0].to(torch.int64), want)) and nz(wc) == nz(gc) \
+                    and got[0].dtype == STORE[g.dtype(u.root.outputs[0])]
+                nbad = sum(sum(c) if isinstance(c, list) else c for _, _, c in wc)
+                rows.append((name, u.root.idx, label, f"{draw}{f' x{samples}' if samples > 1 else ''}, "
+                             f"{want.numel()} el, {nbad} REQUIRE failures in {len(nz(wc))} records", ok))
+    return rows
+
+
 def linear_rows(gen):
     """the 1x1 CONV2D kernel on synthetic operands against an exact int64 product: zero points, a bias that pushes
     part of the accumulators out of the output type (wrap for INT32, saturation for INT48), 1 and 4 parts."""
@@ -185,6 +237,7 @@ def main(specs):
         name, path = spec.split("=", 1)
         rows += rescale_rows(name, path, 3, gen)
         rows += replay_rows(name, path, 3, gen)
+        rows += unit_rows(name, path, 3, gen)
     bad = [r for r in rows if not r[-1]]
     for r in rows:
         print("ok  " if r[-1] else "FAIL", *r[:-1], flush=True)

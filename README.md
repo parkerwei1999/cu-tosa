@@ -21,7 +21,12 @@ Tensors are stored at their TOSA type (INT8 / INT16 / INT32 natively, INT48 in i
 | as stored | MINIMUM, MAXIMUM, SELECT, CLAMP, REDUCE_MAX, TRANSPOSE, RESHAPE, SLICE, CONCAT | the int64 emulator's method on the stored tensors (the result does not depend on the width) |
 | fallback | other CONV2D, MATMUL of other types, and any attribute combination a kernel declines (double rounding, unsigned RESCALE, a TABLE whose slope REQUIRE can fail) | widen to int64, run the int64 emulator's method, narrow |
 
-`Emulator.how` records the path of every operator of the last run. On a CPU device the whole run is the int64 emulator.
+On top of that, trees of pointwise operators (RESCALE, ADD, SUB, MUL, TABLE, MINIMUM, MAXIMUM, GREATER,
+GREATER_EQUAL, SELECT, with RESHAPE between them) run as one generated kernel each (`cutosa/fusion.py` plans the
+units, `cutosa/kernels/fused.py` generates a kernel per unit structure): the members are computed in registers,
+every member's REQUIREs are still counted, and only the root's result is stored. `Emulator(fuse=False)` turns it off.
+
+`Emulator.how` records the path of every operator of the last run (`fused` for the members of a unit). On a CPU device the whole run is the int64 emulator.
 
 ## Limits
 
@@ -40,6 +45,7 @@ These stop a run with an exception; none gives a wrong result.
 PYTHONPATH=. python tests/kernel_check.py name=graph.tosa ...     # each kernel against the int64 emulator's operator
 PYTHONPATH=. python tests/graph_equiv.py name=graph.tosa ...      # whole graphs, bit for bit, with timing
 tests/run_ut_vs_reference.sh <tosa_emu_op_check.py> graph.tosa ...  # operator instances against tosa_reference_model
+PYTHONPATH=. python tests/fusion_stats.py name=graph.tosa ...     # what the fusion plan removes
 PYTHONPATH=. python tests/big_index_check.py                      # flat indices beyond 2^31 (5 GiB of GPU memory)
 PYTHONPATH=. python tests/profile_ops.py name=graph.tosa ...      # time per operator and path
 python proofs/limb_proof.py                                        # Z3: the limb identity and accumulator bounds of MATMUL

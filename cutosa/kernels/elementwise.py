@@ -65,20 +65,28 @@ def broadcast_shape(a, b):
     return tuple(y if x == 1 else x for x, y in zip(a, b))
 
 
-def _operand(x, shape):
-    """x -> (contiguous tensor, inner, n, flat) for the index (flat // inner) % n over the output's flat index."""
+def index_plan(xshape, shape):
+    """how an operand of shape xshape is read over the flat index of `shape` (which it broadcasts to):
+    -> (mode, inner, n): "flat" (the same elements), "index" ((flat // inner) % n) or "expand" (expand it first)."""
     total = math.prod(shape)
-    xs = (1,) * (len(shape) - x.dim()) + tuple(x.shape)
-    x = x.contiguous()
+    xs = (1,) * (len(shape) - len(xshape)) + tuple(xshape)
     if xs == tuple(shape):
-        return x, 1, total, True
+        return "flat", 1, total
     run = [i for i, d in enumerate(xs) if d != 1]
     if not run:
-        return x, 1, 1, False
+        return "index", 1, 1
     i0, i1 = run[0], run[-1]
     if all(xs[i] == shape[i] for i in range(i0, i1 + 1)):
-        return x, math.prod(shape[i1 + 1:]), math.prod(xs[i0:i1 + 1]), False
-    return x.expand(shape).contiguous(), 1, total, True
+        return "index", math.prod(shape[i1 + 1:]), math.prod(xs[i0:i1 + 1])
+    return "expand", 1, total
+
+
+def _operand(x, shape):
+    """x -> (contiguous tensor, inner, n, flat) for the index (flat // inner) % n over the output's flat index."""
+    mode, inner, n = index_plan(x.shape, shape)
+    if mode == "expand":
+        return x.expand(shape).contiguous(), 1, n, True
+    return x.contiguous(), inner, n, mode == "flat"
 
 
 def binary(op, a, b, out_dtype, lo, hi, cbuf, c0, shift=0, parts=1):

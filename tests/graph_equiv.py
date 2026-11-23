@@ -1,9 +1,10 @@
 """Whole graphs: cutosa.Emulator against cutosa.Int64Emulator on CUDA, bit for bit.
 
 Per graph and per input set (all-minimum, all-maximum, random minimum / maximum, small values, two uniform draws):
-the outputs, the REQUIRE violation lists and a checksum (sum, sum of squares, min, max) of every operator's result
-must be equal; the first operator that differs is reported. Also prints how each operator ran (kernel / as stored /
-fallback) and the time of one run of each emulator.
+the outputs, the REQUIRE violation lists and a checksum (sum, sum of squares, min, max) of every stored operator
+result must be equal, with fusion (the default: the members of a fusion unit other than its root are not stored) and
+without it (every operator); the first operator that differs is reported. Also prints how each operator ran (fused /
+kernel / as stored / fallback) and the time of one run of the int64 emulator, cu-tosa without fusion and cu-tosa.
 usage: python tests/graph_equiv.py [--trials 7] name=graph.tosa ...
 """
 import argparse
@@ -61,7 +62,9 @@ def main(args):
     for spec in args.graphs:
         name, path = spec.split("=", 1)
         g = TosaGraphIR(path)
-        ref, cu = Int64Emulator(g, device="cuda"), Emulator(g, device="cuda", verify_narrow=True)
+        ref = Int64Emulator(g, device="cuda")
+        arms = {"fused": Emulator(g, device="cuda", verify_narrow=True),
+                "unfused": Emulator(g, device="cuda", verify_narrow=True, fuse=False)}
         rng = np.random.default_rng(args.seed)
         ok, first, nviol = True, None, 0
         for trial in range(args.trials):
@@ -70,26 +73,32 @@ def main(args):
             want = ref.run(f, hook=lambda o, outs: sums.__setitem__(o.idx, [checksum(t) for t in outs]))
             want_v = list(ref.violations)
 
-            def cmp(o, outs, trial=trial):
-                nonlocal first
-                if first is None and [checksum(t) for t in outs] != sums[o.idx]:
-                    first = (trial, o.idx, o.op, cu.how.get(o.idx))
+            for arm, cu in arms.items():
+                def cmp(o, outs, trial=trial, arm=arm, cu=cu):
+                    nonlocal first
+                    if first is None and [checksum(t) for t in outs] != sums[o.idx]:
+                        first = (arm, trial, o.idx, o.op)
 
-            got = cu.run(f, hook=cmp)
-            same = all(a.dtype == b.dtype and np.array_equal(a, b) for a, b in zip(want, got)) \
-                and want_v == cu.violations and first is None
+                got = cu.run(f, hook=cmp)
+                if first is None and want_v != cu.violations:
+                    first = (arm, trial, "violations", [v for v in cu.violations if v not in want_v][:2],
+                             [v for v in want_v if v not in cu.violations][:2])
+                ok &= all(a.dtype == b.dtype and np.array_equal(a, b) for a, b in zip(want, got)) and first is None
             nviol += len(want_v)
-            ok &= same
-        how = Counter(cu.how.values())
-        fast = Emulator(g, device="cuda")
+        how = Counter(arms["fused"].how.values())
         f = feeds(g, 5, rng)
-        fast.run(f)
-        t_ref, t_cu = timed(ref, f, args.reps), timed(fast, f, args.reps)
+        t = {"int64": timed(ref, f, args.reps)}
+        for arm in ("unfused", "fused"):
+            fast = Emulator(g, device="cuda", fuse=arm == "fused")
+            fast.run(f)
+            t[arm] = timed(fast, f, args.reps)
+            del fast
         print(f"{'ok  ' if ok else 'FAIL'} {name}: {args.trials} input sets, {nviol} violation records equal, "
-              f"ops {dict(how)}, int64 {t_ref * 1e3:.0f} ms, cu-tosa {t_cu * 1e3:.0f} ms ({t_ref / t_cu:.2f}x)"
-              + (f", first difference (input set, op, name, how): {first}" if first else ""), flush=True)
+              f"ops {dict(how)}, int64 {t['int64'] * 1e3:.0f} ms, unfused {t['unfused'] * 1e3:.0f} ms, cu-tosa "
+              f"{t['fused'] * 1e3:.0f} ms ({t['int64'] / t['fused']:.2f}x)"
+              + (f", first difference (arm, input set, op, name): {first}" if first else ""), flush=True)
         ok_all &= ok
-        del ref, cu, fast
+        del ref, arms
         torch.cuda.empty_cache()
     print("RESULT:", "PASS" if ok_all else "FAIL")
     return 0 if ok_all else 1
