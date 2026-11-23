@@ -47,6 +47,19 @@ python proofs/limb_proof.py                                        # Z3: the lim
 
 Needs torch (with triton), numpy and `tosa-tools`; `z3-solver` only for `proofs/`.
 
+## Running the kit on cu-tosa without editing it
+
+`tests/kit_overlay/sitecustomize.py` replaces the `Emulator` of the kit's `tosa_exec.tosa_emu` by `cutosa.Emulator`
+as that module loads, so `--backends tosa_torch` runs on cu-tosa (worker processes included):
+
+```
+export PYTHONPATH=<cu-tosa>/tests/kit_overlay:$PWD/ovl:$PWD CUTOSA_KIT_OVERLAY=1      # in fine_grained_transformer_u85
+python3 tosa_exec/integration_test.py --tosa-torch-device cuda --swin                 # TOSA_CPU vs cu-tosa, bit for bit
+```
+
+The line `[cu-tosa overlay] ...` on stderr confirms the replacement. This is a test aid until the kit has its own
+`tosa_cu` backend.
+
 ## `cutosa/int64_ref.py`
 
 A verbatim copy of `fine_grained_transformer_u85/tosa_exec/tosa_emu.py` of the MLEK-Transformer kit at commit af62dd1.
