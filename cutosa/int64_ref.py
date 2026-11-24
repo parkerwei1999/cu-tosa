@@ -1,27 +1,6 @@
-"""Integer emulator of TOSA 1.0 INT-profile graphs on torch (CPU or CUDA); target = bit-exact with tosa_reference_model.
-
-Data path: every tensor is a torch.int64 tensor holding values of its TOSA dtype (INT8 / INT16 / INT32 / INT48).
-No floating point anywhere: wide math is int64, matmul / conv accumulate through torch._int_mm (int8 x int8 -> int32,
-exact) on int8 limbs of the operands, so CPU and CUDA give identical bits by construction.
-
-Semantics follow the TOSA 1.0 pseudo-code and, where the spec says REQUIRE / leaves overflow unpredictable, the
-reference model's observable behaviour: an ADD / SUB / MUL (any shift) / REDUCE_SUM result outside INT32 wraps to its
-low 32 bits, int32 conv / matmul accumulators wrap, int48 accumulators saturate. REQUIRE violations are recorded in
-Emulator.violations (op index, op, message, element count); graph_status() turns them into the reference model's graph
-status (an INT32 MUL with shift 0 is recorded but, as in the reference model, leaves the graph VALID). A run of a graph
-lowered for a batch of independent samples (run(samples=n)) counts the elements per sample instead (a list of n
-counts), so graph_status(violations, sample) is the status of one sample: an op computed from the graph inputs splits
-its checked tensor along the outermost dimension other than 1, an op on constants only (a positional embedding, a bias
-table) counts its elements for every sample, as each sample's own run computes it. The split assumes the batch is the
-outermost factor of that dimension; check that before relying on it for a graph (a dimension that is not a multiple
-of n raises).
-Ops other than the ones with an op_<NAME> method below raise NotImplementedError.
-
-usage (library):
-    g = TosaGraphIR("graph.tosa"); emu = Emulator(g, device="cpu")
-    outs = emu.run([np_input0, ...])          # list of numpy arrays, dtype of each graph output (INT48 -> int64)
-    status = graph_status(emu.violations)     # "VALID" or "UNPREDICTABLE"
-"""
+"""int64 torch emulator of TOSA 1.0 INT-profile graphs (CPU or CUDA), bit-exact with tosa_reference_model; the
+oracle and fallback of cutosa.Emulator. Overflow as in the reference model: ADD / SUB / MUL / REDUCE_SUM and int32
+accumulators wrap, int48 accumulators saturate; REQUIRE failures go to Emulator.violations (graph_status())."""
 import importlib
 import inspect
 from dataclasses import dataclass, field
@@ -41,22 +20,18 @@ RANGE = {"BOOL": (0, 1), "INT8": (-(1 << 7), (1 << 7) - 1), "INT16": (-(1 << 15)
 BITS = {"INT8": 8, "INT16": 16, "INT32": 32, "INT48": 48}
 NP_DTYPE = {"BOOL": np.bool_, "INT8": np.int8, "INT16": np.int16, "INT32": np.int32, "INT48": np.int64}
 ROUND_SINGLE, ROUND_INEXACT, ROUND_DOUBLE = 1, 2, 3  # tosa.RoundingMode
-VALID, UNPREDICTABLE = "VALID", "UNPREDICTABLE"  # tosa_reference_model GraphStatus names without the TOSA_ prefix
-# REQUIRE checks (message prefixes) that the reference model does not make: an INT32 MUL with shift 0 keeps the low 32
-# bits of the product and the graph stays VALID there. Recorded, but they leave graph_status() VALID too.
+VALID, UNPREDICTABLE = "VALID", "UNPREDICTABLE"  # reference-model GraphStatus names
+# REQUIREs the reference model does not check (an INT32 MUL with shift 0 keeps the low 32 bits): still VALID
 UNCHECKED_BY_REFERENCE = ("MUL result (shift 0)",)
 
 
 def graph_status(violations: list, sample: int | None = None) -> str:
-    """The reference model's graph status for an emulator run's violations: UNPREDICTABLE when a REQUIRE check that the
-    reference model also makes failed, VALID otherwise. sample: of a run over samples, the status of that sample."""
+    """UNPREDICTABLE if a REQUIRE that the reference model also checks failed (in `sample`, for a run over samples)."""
     return UNPREDICTABLE if any(not v[2].startswith(UNCHECKED_BY_REFERENCE) and (sample is None or v[3][sample])
                                 for v in violations) else VALID
 
 
-# ----------------------------------------------------------------------------------------------------------------------
-# flatbuffer -> plain python IR
-# ----------------------------------------------------------------------------------------------------------------------
+# -- flatbuffer -> plain python IR -------------------------------------------------------------------------------------
 @dataclass
 class TensorInfo:
     name: str
@@ -88,8 +63,7 @@ def _decode_const(t, dtype, shape):
         v = np.frombuffer(raw, NP_DTYPE[dtype]).astype(np.int64)
     n = int(np.prod(shape)) if len(shape) else 1
     if v.size > n and n == 1 and (v == v[0]).all():
-        # ExecuTorch 1.x writes CONV2D weight_zp as an OC-long all-equal vector under declared shape [1]:
-        # keep the declared shape (value unambiguous); anything else is rejected below
+        # ExecuTorch 1.x writes CONV2D weight_zp as an OC-long all-equal vector under the declared shape [1]
         v = v[:1]
     if v.size != n:
         raise ValueError(f"const {t.Name().decode()}: {v.size} values for shape {shape}")
@@ -97,7 +71,6 @@ def _decode_const(t, dtype, shape):
 
 
 def _attr_values(o):
-    """Generic read of an operator's attribute table -> {field: value}."""
     name = ATTR_NAMES.get(o.AttributeType(), "NONE")
     if name == "NONE" or o.Attribute() is None:
         return {}
@@ -159,39 +132,33 @@ class TosaGraphIR:
         return self.tensors[name].dtype if name in self.tensors else "SHAPE"
 
 
-# ----------------------------------------------------------------------------------------------------------------------
-# exact integer matmul through int8 limbs + torch._int_mm
-# ----------------------------------------------------------------------------------------------------------------------
+# -- exact integer matmul through int8 limbs + torch._int_mm -----------------------------------------------------------
 def _limbs(x, nbits):
-    """x (int64, values in [-2^(nbits-1), 2^(nbits-1))) -> (int8 limbs low..high, offset c) with
-    x == sum_i 256^i * limb_i + c exactly. 8-bit operands are their own single limb (c = 0)."""
+    """x (nbits signed values) -> (int8 limbs, low first, c) with x == sum 256^i limb_i + c."""
     nl = (nbits + 7) // 8
     if nl == 1:
         return [x.to(torch.int8)], 0
     off = 1 << (8 * nl - 1)
-    u = x + off  # in [0, 256^nl)
+    u = x + off
     limbs = [(((u >> (8 * i)) & 255) - 128).to(torch.int8) for i in range(nl)]
     c = 128 * sum(256 ** i for i in range(nl)) - off
     return limbs, c
 
 
-# cuBLASLt's int8 GEMM kernel reads past the end of an operand (compute-sanitizer memcheck on RTX 4000 Ada,
-# CUDA 13.0, torch 2.12: 4-byte reads up to 10 781 bytes after a [1504, 384] operand, about one 32-row tile). A read
-# that crosses into an unmapped page faults ("an illegal memory access"), so every operand is followed by this many
-# zero rows of its own width in the same allocation.
+# cuBLASLt's int8 GEMM reads up to ~10.8 kB past an operand (memcheck; CUDA 13.0, torch 2.12) and faults at a page
+# end: zero rows follow each operand. Remove when memcheck shows no over-read.
 _CUDA_SLACK_ROWS = 256
 
 
 def _cuda_operand(x, rows, cols):
-    """x zero-padded to [rows, cols], contiguous, followed by _CUDA_SLACK_ROWS zero rows in the same allocation."""
+    """x zero-padded to [rows, cols], with _CUDA_SLACK_ROWS zero rows after it in the same allocation."""
     buf = torch.zeros(rows + _CUDA_SLACK_ROWS, cols, dtype=torch.int8, device=x.device)
     buf[:x.shape[0], :x.shape[1]] = x
     return buf[:rows]
 
 
-# cuBLASLt's int8 GEMM returns CUBLAS_STATUS_NOT_SUPPORTED from M = 65536 rows on (RTX 4000 Ada, torch 2.12; 65504
-# works): Swin-T's patch embedding and stage-1 MLP reach M = 200704 at batch 64. Rows are independent, so a larger M
-# runs in blocks of this many rows.
+# cuBLASLt's int8 GEMM is NOT_SUPPORTED from M = 65536 (torch 2.12; Swin-T at batch 64 reaches 200704): blocks of
+# rows. Remove when a larger M works.
 _CUDA_MAX_ROWS = 32768
 
 
@@ -199,7 +166,7 @@ def _int_mm(a8, b8):
     """int8 [M,K] x int8 [K,N] -> int64 [M,N] via torch._int_mm (int32 accumulation, exact for K < 2^17)."""
     m, k = a8.shape
     n = b8.shape[1]
-    if a8.is_cuda:  # cuBLASLt int8 GEMM: zero-pad M to a multiple of 32 (some GPUs reject others), K and N to 8
+    if a8.is_cuda:  # zero-pad M to a multiple of 32 (some GPUs reject others), K and N to 8
         kp, np_ = -(-k // 8) * 8, -(-n // 8) * 8
         b = _cuda_operand(b8, kp, np_)
         out = []
@@ -212,8 +179,8 @@ def _int_mm(a8, b8):
 
 
 def imatmul(a, b, a_bits, b_bits, a_zp=0, b_zp=0, backend="intmm"):
-    """Exact sum_k (a[m,k] - a_zp) * (b[k,n] - b_zp) as int64. a: [M,K], b: [K,N] int64 tensors whose values fit
-    a_bits / b_bits signed. backend 'int64' = plain int64 torch.matmul (CPU only, used as an independent oracle)."""
+    """exact sum_k (a - a_zp)(b - b_zp) as int64; a [M, K], b [K, N] hold a_bits / b_bits signed values.
+    backend "int64": plain torch.matmul (CPU only, an independent oracle)."""
     if a.shape[1] >= (1 << 17):
         raise NotImplementedError("K >= 2^17 would overflow the int32 _int_mm accumulator")
     if backend == "int64":
@@ -239,11 +206,8 @@ def imatmul(a, b, a_bits, b_bits, a_zp=0, b_zp=0, backend="intmm"):
 
 
 def ibmm(a, b, a_bits, b_bits, a_zp=0, b_zp=0):
-    """imatmul over a batch: exact sum_k (a[n,m,k] - a_zp) * (b[n,k,p] - b_zp) as int64 for a: [N,M,K], b: [N,K,P]
-    int64 tensors whose values fit a_bits / b_bits signed, one batched GEMM per pair of 8-bit limbs instead of one
-    small GEMM per n (Swin's window attention: batch x windows x heads matrices, 1824 per image on Swin-T). A limb
-    product is at most 2^14 in magnitude, so every partial sum over K <= 1024 stays below 2^24 and float32 is exact;
-    float64 beyond that, or when TF32 may round the operands."""
+    """imatmul over a batch [N, M, K] x [N, K, P] with one batched GEMM per limb pair (Swin-T window attention: 1824
+    matrices per image). A limb product is < 2^14, so sums over K <= 1024 are exact in float32; float64 otherwise."""
     K = a.shape[-1]
     ft = torch.float32 if K <= 1024 and not torch.backends.cuda.matmul.allow_tf32 else torch.float64
     la, ca = _limbs(a, a_bits)
@@ -271,9 +235,7 @@ def _wrap(x, bits):
     return ((x + half) & ((1 << bits) - 1)) - half
 
 
-# ----------------------------------------------------------------------------------------------------------------------
-# emulator
-# ----------------------------------------------------------------------------------------------------------------------
+# -- emulator ----------------------------------------------------------------------------------------------------------
 class Emulator:
     def __init__(self, graph, device="cpu", check=True, mm_backend="intmm"):
         self.g = graph if isinstance(graph, TosaGraphIR) else TosaGraphIR(graph)
@@ -283,10 +245,9 @@ class Emulator:
         self.consts = {n: torch.from_numpy(t.data).to(self.device) for n, t in self.g.tensors.items()
                        if t.data is not None}
         self.violations = []
-        self.samples = 1  # run(samples=n): REQUIRE counts per sample
-        self._from_inputs = True  # run(): the current op reads a tensor computed from the graph inputs
-        self.faults = {}  # op index -> f(list of outputs) -> outputs; test hook that perturbs an op's outputs
-        # last use of every tensor (to free intermediates early)
+        self.samples = 1
+        self._from_inputs = True
+        self.faults = {}  # test hook: op index -> f(outputs) -> perturbed outputs
         self.last_use = {}
         for o in self.g.ops:
             for n in o.inputs:
@@ -294,10 +255,8 @@ class Emulator:
 
     # -- helpers ---------------------------------------------------------------------------------------------------
     def _per_sample(self, o, bad):
-        """bad (bool tensor) -> int64 counts per sample. An op computed from the graph inputs splits its outermost
-        dimension other than 1 (the lowering adds leading 1s, e.g. (1, B, N, C)) into self.samples equal parts,
-        sample-major; an op on constants only, or a scalar check (one that does not depend on the data), counts its
-        elements once for every sample."""
+        """bad -> int64 counts per sample: an op on graph-input data splits its outermost non-1 dimension into
+        self.samples equal parts (sample-major); an op on constants only, or a scalar check, counts for every sample."""
         if bad.dim() == 0 or not self._from_inputs:
             return bad.sum().to(torch.int64).expand(self.samples)
         if next((d for d in bad.shape if d != 1), 1) % self.samples:
@@ -306,7 +265,7 @@ class Emulator:
         return bad.reshape(self.samples, -1).sum(1)
 
     def _require(self, o, ok, msg):
-        """record a TOSA REQUIRE violation (ok = bool tensor or python bool)."""
+        """ok: bool tensor or python bool."""
         if not self.check:
             return
         if self.samples > 1:
@@ -321,9 +280,7 @@ class Emulator:
             self.violations.append((o.idx, o.op, msg, 1))
 
     def _count_bad(self, o, x, lo, hi, msg):
-        """record a REQUIRE violation for the elements of x outside [lo, hi] (scalars, or tensors broadcastable to x).
-        CUDA: the count stays on the device until the end of run() (no per-op host sync). CPU: scalar bounds take a
-        single min/max reduction on the common (all-valid) path."""
+        """the elements of x outside [lo, hi]; on CUDA the count stays on the device until run() ends."""
         if not self.check or x.numel() == 0:
             return
         if self.samples > 1:
@@ -355,7 +312,7 @@ class Emulator:
         return int(v.reshape(-1)[0])
 
     def _host(self, name):
-        """constant operand on host as numpy int64 (shift / multiplier / zero points / shapes)."""
+        """a constant operand (shift, multiplier, zero point, shape) as host int64."""
         if name in self.g.shapes:
             return np.array(self.g.shapes[name], np.int64)
         v = self.g.tensors[name].data
@@ -365,15 +322,13 @@ class Emulator:
 
     # -- driver ----------------------------------------------------------------------------------------------------
     def run(self, inputs, hook=None, keep=(), samples=1):
-        """inputs: list (graph input order) of numpy / torch integer arrays. hook(op, [out tensors]) is called after
-        every non-constant op. keep: tensor names to retain in self.env after the run. samples: the independent samples
-        of a graph lowered at a batch (its leading dimension); > 1 counts REQUIRE violations per sample. Returns numpy
-        outputs."""
+        """inputs: integer arrays in graph input order. hook(op, outs): after every non-constant op. keep: tensor names
+        to leave in self.env. samples > 1: REQUIRE counts per sample of a graph lowered at that batch."""
         g = self.g
         if len(inputs) != len(g.inputs):
             raise ValueError(f"graph has {len(g.inputs)} inputs, got {len(inputs)}")
         self.violations, self._pending, self.samples = [], [], samples
-        from_inputs = set(g.inputs)  # tensors computed from the graph inputs; the others come from constants only
+        from_inputs = set(g.inputs)
         env = dict(self.consts)
         for name, x in zip(g.inputs, inputs):
             t = torch.as_tensor(np.asarray(x)) if not isinstance(x, torch.Tensor) else x
@@ -402,11 +357,11 @@ class Emulator:
                 env[n] = t
             if hook is not None:
                 hook(o, outs)
-            for n in o.inputs:  # free intermediates after their last use
+            for n in o.inputs:
                 if self.last_use.get(n) == o.idx and n not in keep and n not in self.consts:
                     env.pop(n, None)
         self.env = {n: env[n] for n in keep if n in env}
-        if self._pending:  # resolve device-side REQUIRE counts with one transfer, keep op order
+        if self._pending:
             counts = torch.stack([c for *_, c in self._pending]).cpu().tolist()
             self.violations += [(i, op, msg, n) for (i, op, msg, _), n in zip(self._pending, counts) if any(n)] \
                 if self.samples > 1 else [(i, op, msg, n) for (i, op, msg, _), n in zip(self._pending, counts) if n]
@@ -420,7 +375,7 @@ class Emulator:
 
     # -- elementwise -----------------------------------------------------------------------------------------------
     def _checked_wrap(self, o, r, what):
-        """REQUIRE r within the output type, then wrap it to the type's low bits (the reference model's result)."""
+        """REQUIRE r within the output type, then wrap to its low bits (the reference model's result)."""
         dt = self.g.dtype(o.outputs[0])
         self._in_range(o, r, dt, what)
         return _wrap(r, BITS[dt])
@@ -474,7 +429,7 @@ class Emulator:
             return [table[x + 128]]
         if dt != "INT16":
             raise NotImplementedError(f"TABLE input {dt}")
-        tab_slope = table[1:] - table[:-1]  # 512 slopes of the 513-entry table
+        tab_slope = table[1:] - table[:-1]
         idx = x >> 7  # 9-bit index, 7-bit fraction (TOSA apply_lookup_s)
         idx += 256
         frac = x & 0x7F
@@ -534,9 +489,7 @@ class Emulator:
 
     # -- reductions ------------------------------------------------------------------------------------------------
     def op_REDUCE_SUM(self, o, x):
-        """REQUIRE as TOSA 1.0 states it (apply_add_s per element: every running sum in index order along the axis,
-        not only the total, must fit the output type); the total wraps to the type's low bits like the reference
-        model's int32 accumulation."""
+        """REQUIRE on every running sum along the axis (TOSA apply_add_s), not only the total; the total wraps."""
         axis, dt = o.attrs["Axis"], self.g.dtype(o.outputs[0])
         if self.check:
             lo, hi = RANGE[dt]

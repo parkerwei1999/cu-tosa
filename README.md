@@ -57,6 +57,7 @@ PYTHONPATH=. python tests/fusion_stats.py name=graph.tosa ...     # what the fus
 PYTHONPATH=. python tests/big_index_check.py                      # flat indices beyond 2^31 (5 GiB of GPU memory)
 PYTHONPATH=. python tests/profile_ops.py name=graph.tosa ...      # time per operator and path
 python proofs/limb_proof.py                                        # Z3: the limb identity and accumulator bounds of MATMUL
+python tests/ref_sync.py <kit tosa_emu.py>                         # int64_ref.py has the kit emulator's code
 ```
 
 Needs torch (with triton), numpy and `tosa-tools`; `z3-solver` only for `proofs/`.
@@ -76,5 +77,6 @@ The line `[cu-tosa overlay] ...` on stderr confirms the replacement. This is a t
 
 ## `cutosa/int64_ref.py`
 
-A verbatim copy of `fine_grained_transformer_u85/tosa_exec/tosa_emu.py` of the MLEK-Transformer kit at commit 47dd6e5.
-Keep it byte-identical to its source until the kit imports it from here; `cmp` the two files to check.
+The code of `fine_grained_transformer_u85/tosa_exec/tosa_emu.py` of the MLEK-Transformer kit at commit 47dd6e5, with
+shorter comments and docstrings. `python tests/ref_sync.py <kit>/fine_grained_transformer_u85/tosa_exec/tosa_emu.py`
+checks that the code is the same (AST without docstrings).

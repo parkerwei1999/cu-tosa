@@ -1,6 +1,5 @@
 #!/bin/bash
-# The op-level test against Arm's tosa_reference_model (written for the kit's tosa_emu), run on the cu-tosa emulator
-# through tests/shim. UT = path of tosa_emu_op_check.py; graphs = the .tosa files to take real operator instances from.
+# The kit's op-level test against tosa_reference_model, run on cu-tosa through tests/shim.
 # usage: tests/run_ut_vs_reference.sh <tosa_emu_op_check.py> graph.tosa ...
 here=$(cd "$(dirname "$0")/.." && pwd)
 ut=$1; shift

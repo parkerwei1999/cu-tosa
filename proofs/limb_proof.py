@@ -1,13 +1,6 @@
-"""Z3 proof of the arithmetic of the fused INT16 x INT16 tensor-core kernel (mm_bench.py _bmm_i16_fused), for every
-pair of INT16 codes, and the largest K for which each of its int32 accumulators cannot overflow.
-
-Kernel: u = x + 32768, hi = (u >> 8) - 128, lo = (u & 255) - 128 (cast to int8); per k it accumulates in int32
-hh += hi_x * hi_y, hl += hi_x * lo_y + lo_x * hi_y, ll += lo_x * lo_y, rs += x - 128, cs += y - 128, then writes
-(hh << 16) + (hl << 8) + ll + 128 rs + 128 cs + 128 * 128 * K in int64.
-Integer theory: u >= 0, so u >> 8 = u div 256 and u & 255 = u mod 256. (A 64-bit bit-vector version of the product
-identity did not finish in 10 minutes: multiplier equivalence is hard for bit-blasting.)
-usage: python limb_proof.py   (needs z3-solver)
-"""
+"""Z3: the limb identity of the INT16 x INT16 kernel (cutosa/kernels/matmul.py) for every pair of INT16 codes, and
+the largest K for which its int32 accumulators cannot overflow. Integer theory: 64-bit bit-vector products did not
+finish in 10 minutes.  usage: python proofs/limb_proof.py   (needs z3-solver)"""
 from z3 import And, Int, Not, Or, Solver, unsat
 
 
@@ -32,7 +25,7 @@ dom = And(xr, yr)
 ok = prove("limbs fit int8: -128 <= hi, lo <= 127", xr,
            And(xh >= -128, xh <= 127, xl >= -128, xl <= 127))
 ok &= prove("x == 256 hi + lo + 128", xr, x == 256 * xh + xl + 128)
-# with x = 256 hx + lx + 128 (just proved) the product identity is a polynomial identity in hx, lx, hy, ly
+# with x = 256 hx + lx + 128 proved, the product identity is a polynomial identity
 hx, lx, hy, ly = Int("hx"), Int("lx"), Int("hy"), Int("ly")
 lim = And(*[And(v >= -128, v <= 127) for v in (hx, lx, hy, ly)])
 X, Y = 256 * hx + lx + 128, 256 * hy + ly + 128
