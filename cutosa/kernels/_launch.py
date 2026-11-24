@@ -1,16 +1,6 @@
-"""Kernel launch without Triton's per-call lookup.
-
-`fn[grid](*args)` derives a specialization from the argument *values* on every call (an integer equal to 1 becomes a
-constant, divisibility by 16, i32 or i64 by magnitude, pointer alignment), hashes it and looks the compiled kernel up:
-about 15 us a launch, as much as the launch itself for the small tensors of a decoder step.
-
-`jit` declares a kernel whose compiled form depends only on the element types of its tensor arguments and on its
-constexprs: no parameter is specialized on its value, and every scalar parameter is annotated tl.int64. The
-parameters come in the order: tensors (named *_ptr), scalars, constexprs. `Kernel.launch` keeps the compiled kernel
-per (device, tensor element types, constexprs) and calls Triton's launcher directly. The direct call follows
-triton/runtime/jit.py (JITFunction.run) of the versions in DIRECT_VERSIONS; with another version, with a launch hook
-installed, or with CUTOSA_DIRECT_LAUNCH=0, every launch goes through `fn[grid]`.
-"""
+"""Kernel launch without Triton's per-call specialization on argument values (~15 us, as much as a small kernel).
+Compiled kernels are keyed by (device, tensor dtypes, constexprs); the direct call mirrors JITFunction.run of the
+Triton versions in DIRECT_VERSIONS; another version, a launch hook or CUTOSA_DIRECT_LAUNCH=0 uses fn[grid]."""
 import inspect
 import os
 
@@ -40,9 +30,8 @@ class Kernel:
         self._compiled = {}
 
     def launch(self, grid, args, consts=(), types=None, **options):
-        """args: the tensors, then the scalars (python ints). consts: the constexprs, in order. types: the element
-        types of the tensors when the caller already has them as a tuple (else they are read from args). options:
-        Triton compile options (num_stages), used when the kernel is first compiled."""
+        """args: tensors, then python-int scalars. types: the tensors' dtypes when the caller has them. options:
+        Triton compile options, used at the first compile."""
         if types is None:
             types = tuple([a.dtype for a in args[:self.nptr]])
         device = driver.active.get_current_device()

@@ -1,7 +1,5 @@
-"""Where one run of the cu-tosa emulator spends its time: per operator and path (kernel / stored / fallback), with a
-device synchronisation after every operator (so the total is larger than an unsynchronised run).
-usage: python tests/profile_ops.py name=graph.tosa ...
-"""
+"""Time of one cu-tosa run per operator and path, synchronising after each operator (total > unsynchronised).
+usage: python tests/profile_ops.py name=graph.tosa ..."""
 import sys
 import time
 from collections import defaultdict

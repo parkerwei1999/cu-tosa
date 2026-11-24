@@ -1,12 +1,5 @@
-"""MATMUL INT16 x INT16 -> INT48 on the int8 tensor cores, one fused kernel.
-
-Tensor cores have no 16-bit integer multiply-accumulate (int8 is the widest integer type), so each INT16 operand is
-split in registers into two int8 limbs: x = 256 hi + lo + 128 with hi, lo in [-128, 127]. Then
-    x * y = 65536 hi_x hi_y + 256 (hi_x lo_y + lo_x hi_y) + lo_x lo_y + 128 (x - 128) + 128 (y - 128) + 16384
-so a batched matmul is four int8 dot products (int32 accumulators) plus the row sums of x - 128 and the column sums of
-y - 128, combined in int64 and written once. proofs/limb_proof.py proves the identity for every INT16 pair and the
-accumulator bounds: the row / column sums overflow int32 first, at K > 65280.
-"""
+"""MATMUL INT16 x INT16 -> INT48 on int8 tensor cores (no 16-bit integer MMA): x = 256 hi + lo + 128, so
+x y = 65536 hx hy + 256 (hx ly + lx hy) + lx ly + 128 (x - 128) + 128 (y - 128) + 16384 (proofs/limb_proof.py)."""
 import torch
 import triton
 import triton.language as tl
@@ -18,8 +11,7 @@ BM, BN, BK = 64, 64, 32
 
 
 def fits(Bn, M, K, N):
-    """whether bmm_i16 takes these shapes: K within the proof, the launch grid within CUDA's 65535 on its second
-    and third axis, and every element offset (computed in int32 from the strides) below 2^31."""
+    """K within the proof, launch grid axes 2 and 3 <= 65535, int32 element offsets < 2^31."""
     return K <= MAX_K and Bn <= 65535 and triton.cdiv(N, BN) <= 65535 and max(Bn * M * K, Bn * K * N, Bn * M * N) < 2**31
 
 

@@ -1,8 +1,5 @@
-"""Flat indices beyond 2^31 (needs ~5 GiB of GPU memory): ADD of an int8 (N, 1) with an int8 (1, 1024), 2^31 + 1024
-output elements in one part, then RESCALE and REDUCE_SUM over that tensor, each against torch on slices, and the
-generated kernel of the unit ADD + RESCALE against the two separate results.
-usage: python tests/big_index_check.py
-"""
+"""Flat indices beyond 2^31 (~5 GiB GPU memory): ADD, RESCALE, REDUCE_SUM and a fused ADD + RESCALE unit over
+2^31 + 1024 elements, against torch on slices.  usage: python tests/big_index_check.py"""
 import sys
 
 import torch

@@ -1,13 +1,6 @@
-"""Fusion on graphs the real ones do not contain: small synthetic TOSA graphs, cutosa.Emulator with fusion against
-cutosa.Int64Emulator and against cutosa.Emulator(fuse=False).
-
-Fixed cases (an operand read twice by one operator, RESHAPE inside a unit, broadcast leaves, per-channel RESCALE
-before a RESHAPE, wrapped results feeding the next member, a TABLE slope outside INT16, members without a REQUIRE,
-one Emulator object run with several `keep` sets) and random graphs of pointwise operators. Every graph runs at
-several sample counts with the REQUIRE check on and off; outputs, violation lists and kept tensors must be equal, or
-both emulators must raise the same exception type.
-usage: python tests/fusion_cases.py [--random 30] [--seed 0]
-"""
+"""Fusion on synthetic and random graphs: fused and unfused cu-tosa vs the int64 emulator at several sample
+counts, check on and off; outputs, violations and kept tensors equal, or the same exception type.
+usage: python tests/fusion_cases.py [--random 30] [--seed 0]"""
 import argparse
 import sys
 

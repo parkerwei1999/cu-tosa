@@ -1,13 +1,5 @@
-"""RESCALE as one fused kernel: read the input at its stored type, form the product in a 64-bit register, round,
-shift, add the output zero point, count the two REQUIRE failures, clamp, write the output at its stored type.
-
-Covers single rounding with signed input and output, one (multiplier, shift) pair or one pair per channel (channel =
-last dimension), apply_scale_32 and apply_scale_16. The register never leaves int64: |value| < 2^48 with a multiplier
-below 2^15 (apply_scale_16) or |value| <= 2^32 with a multiplier below 2^31 (apply_scale_32), plus a rounding term of
-at most 2^61 (shift <= 62).
-
-REQUIRE counts are added into two rows of the run's counter buffer (int64 [rows, samples]); see Emulator._slots.
-"""
+"""RESCALE kernel: single rounding, signed, one multiplier or one per channel (last dimension), scale 32 / 16.
+The int64 register cannot overflow: |x| <= 2^32 with mult < 2^31, or |x| < 2^48 with mult < 2^15, + <= 2^61."""
 import torch
 import triton
 import triton.language as tl
@@ -21,9 +13,6 @@ BLOCK = 1024
 def _rescale(x_ptr, y_ptr, c_ptr, m_ptr, s_ptr, n_per: tl.int64, c0: tl.int64, c1: tl.int64, C: tl.int64,
              izp: tl.int64, m: tl.int64, s: tl.int64, ozp: tl.int64, olo: tl.int64, ohi: tl.int64,
              SCALE32: tl.constexpr, PER_CHANNEL: tl.constexpr, BLOCK: tl.constexpr):
-    """one block of one sample. Counter c0: the elements that fail the first REQUIRE (SCALE32: the value entering
-    apply_scale_32 outside [-2^(shift-1), 2^(shift-1)); else the result of apply_scale_16 outside INT32); counter c1:
-    the elements whose result + output_zp is outside INT32."""
     pid = tl.program_id(0)
     sid = tl.program_id(1)
     offs = pid.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)  # int64: a part may hold more than 2^31 elements
@@ -57,9 +46,8 @@ def _rescale(x_ptr, y_ptr, c_ptr, m_ptr, s_ptr, n_per: tl.int64, c0: tl.int64, c
 
 
 def rescale(x, out_dtype, mult, shift, izp, ozp, olo, ohi, scale32, per_channel, cbuf, c0, c1, parts=1):
-    """x: contiguous CUDA tensor. mult / shift: python ints, or (per_channel) int64 CUDA tensors of x.shape[-1] values.
-    parts: x is split into this many equal parts in index order; part p adds its REQUIRE counts to the flat elements
-    c0 + p and c1 + p of cbuf (int64). Returns y of x's shape and out_dtype."""
+    """mult / shift: python ints, or int64 CUDA tensors of x.shape[-1] values (per_channel). Part p of `parts`
+    equal parts of x adds its REQUIRE counts to cbuf[c0 + p] and cbuf[c1 + p]."""
     n_per = x.numel() // parts
     y = torch.empty(x.shape, dtype=out_dtype, device=x.device)
     if per_channel:

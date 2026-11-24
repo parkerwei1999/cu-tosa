@@ -1,12 +1,6 @@
-"""Whole graphs: cutosa.Emulator against cutosa.Int64Emulator on CUDA, bit for bit.
-
-Per graph and per input set (all-minimum, all-maximum, random minimum / maximum, small values, two uniform draws):
-the outputs, the REQUIRE violation lists and a checksum (sum, sum of squares, min, max) of every stored operator
-result must be equal, with fusion (the default: the members of a fusion unit other than its root are not stored) and
-without it (every operator); the first operator that differs is reported. Also prints how each operator ran (fused /
-kernel / as stored / fallback) and the time of one run of the int64 emulator, cu-tosa without fusion and cu-tosa.
-usage: python tests/graph_equiv.py [--trials 7] name=graph.tosa ...
-"""
+"""Whole graphs, cu-tosa (fused and unfused) vs the int64 emulator, bit for bit over 7 input sets: outputs,
+violations and a checksum of every stored result; prints each operator's path and the time of one run.
+usage: python tests/graph_equiv.py [--trials 7] name=graph.tosa ..."""
 import argparse
 import statistics
 import sys

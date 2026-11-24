@@ -1,13 +1,5 @@
-"""CONV2D with a 1x1 kernel, stride 1 and no padding (a Linear layer) on the int8 tensor cores, one fused kernel.
-
-Rows = the N * H * W input positions, K = the input channels, columns = the output channels; the weights are INT8
-constants. With zero points:
-    sum_k (x - izp)(w - wzp) = sum_k x w  -  wzp sum_k x  -  izp sum_k w  +  K izp wzp
-sum_k x w is one int8 dot product for an INT8 input and two for an INT16 input (x = 256 hi + lo + 128, as in
-matmul.py, so sum_k x w = 256 sum hi w + sum lo w + 128 sum_k w); sum_k x comes from the row sums in the kernel and
-sum_k w is computed once from the constant. The bias is added, the accumulator REQUIRE is counted, and the result is
-stored as the reference model does: the low 32 bits for an INT32 output, saturated for an INT48 output.
-"""
+"""CONV2D 1x1, stride 1, no padding (a Linear) on int8 tensor cores; INT16 input split into limbs as in matmul.py.
+sum (x - izp)(w - wzp) = sum x w - wzp sum x - izp sum w + K izp wzp. INT32 output wraps, INT48 saturates."""
 import torch
 import triton
 import triton.language as tl
@@ -67,9 +59,8 @@ def _linear(x_ptr, w_ptr, y_ptr, c_ptr, bias_ptr, wsum_ptr, M_per: tl.int64, N: 
 
 
 def linear(x, w, bias64, wsum64, out_dtype, izp, wzp, lo, hi, saturate, cbuf, c0, parts=1):
-    """x: contiguous [M, K] (int8, or int16 for an INT16 input). w: contiguous int8 [N, K]. bias64, wsum64: int64 [N]
-    (the bias, and sum_k w). Returns y [M, N] at out_dtype; part p of `parts` equal row ranges adds the count of its
-    accumulators outside [lo, hi] to the flat element c0 + p of cbuf (int64)."""
+    """x [M, K] int8 or int16, w [N, K] int8, bias64 and wsum64 (sum_k w) int64 [N] -> y [M, N] at out_dtype.
+    Part p of `parts` equal row ranges adds its count of accumulators outside [lo, hi] to cbuf[c0 + p]."""
     M, K = x.shape
     N = w.shape[0]
     if K > MAX_K or N * K >= 2**31 or triton.cdiv(N, 64) > 65535:

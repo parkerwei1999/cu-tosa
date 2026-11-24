@@ -1,29 +1,5 @@
-"""Generated kernels for fusion units (cutosa/fusion.py): one pass over the root's flat index computes every member
-operator in 64-bit registers, counts each operator's REQUIREs, and stores only the root's result.
-
-A unit's kernel is generated from its structure, a hashable `prog`:
-    prog = (leaf modes, ops)
-    leaf modes: one of "f" (read at the flat index) / "i" (read at (flat // inner) % n: a broadcast operand) per leaf
-    ops: per member, in graph order, (kind, flags, operand refs); a ref is "L<k>" (leaf k) or "V<j>" (member j)
-        ("RESCALE", (scale32, per_channel), (x,))
-        ("ADD" | "SUB" | "MUL", (bits of the output type,), (a, b))
-        ("TABLE", (wide, slope_check), (x,))      slope_check: the table has a slope outside INT16 (a REQUIRE)
-        ("MINIMUM" | "MAXIMUM" | "GREATER" | "GREATER_EQUAL", (), (a, b))
-        ("SELECT", (), (condition, a, b))
-The numbers of a unit (zero points, multipliers, shifts, bounds, broadcast strides) are not in the structure: they
-are read from an int64 parameter tensor, laid out by params() in the order the generated code reads it:
-    per "i" leaf: inner, n
-    RESCALE with one multiplier: izp, multiplier, shift, ozp, olo, ohi;  per channel: izp, ozp, olo, ohi, C
-    ADD / SUB: lo, hi        MUL: shift, lo, hi
-Tensor arguments after the leaves: the tables of the TABLEs in member order, then (multipliers, shifts), int64, of
-the per-channel RESCALEs in member order.
-REQUIRE counters, in member order: RESCALE 2, ADD / SUB / MUL 1, TABLE with slope_check 1; counter k of sample s is
-the element cbase + k * cstride + s of the counter buffer.
-
-Every register is int64. A stored ADD / SUB / MUL result is the low bits of the exact value (the reference model's
-wrap), so the register is truncated the same way before the next member reads it; RESCALE clamps and TABLE cannot
-leave its output type.
-"""
+"""One generated Triton kernel per fusion-unit structure: members in int64 registers, every REQUIRE counted,
+only the root stored. The structure `prog` is described at source()."""
 import hashlib
 import linecache
 
@@ -49,6 +25,10 @@ def n_params(prog):
 
 
 def source(prog, name):
+    """prog = (leaf modes, ops). Leaf mode "f": x[g]; "i": x[(g // inner) % n]. Op = (kind, flags, refs), ref "L<k>"
+    or "V<j>"; flags: RESCALE (scale32, per_channel), ADD/SUB/MUL (output bits,), TABLE (wide, slope_check), else ().
+    Params, int64, in read order: per "i" leaf inner, n; RESCALE izp, mult, shift, ozp, lo, hi (per channel izp,
+    ozp, lo, hi, C); ADD/SUB lo, hi; MUL shift, lo, hi. Tensor args after the leaves: tables, then per-channel pairs."""
     modes, ops = prog
     aux = [f"t{j}_ptr" for j, (k, f, _) in enumerate(ops) if k == "TABLE"] \
         + [a for j, (k, f, _) in enumerate(ops) if k == "RESCALE" and f[1] for a in (f"m{j}_ptr", f"s{j}_ptr")]
@@ -109,7 +89,7 @@ def source(prog, name):
                 L.append(f"    {v} = {a} {'+' if kind == 'ADD' else '-'} {b}")
             lo, hi = par(), par()
             count(f"({v} < {lo}) | ({v} > {hi})")
-            L.append(f"    {v} = {v}.to({_INT[flags[0]]}).to(tl.int64)")
+            L.append(f"    {v} = {v}.to({_INT[flags[0]]}).to(tl.int64)")  # wraps as the stored result does
         elif kind == "TABLE":
             x = refs[0]
             if flags[0]:
@@ -135,8 +115,7 @@ def source(prog, name):
 
 
 def kernel(prog):
-    """the compiled-on-first-use kernel of a structure (one per structure in the process; Triton caches the binary on
-    disk by source)."""
+    """the kernel of a structure, compiled once per process."""
     fn = _kernels.get(prog)
     if fn is None:
         name = "fused_" + hashlib.sha256(repr(prog).encode()).hexdigest()[:16]

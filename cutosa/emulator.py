@@ -1,25 +1,5 @@
-"""cu-tosa emulator: the int64 emulator's semantics with every tensor stored at its TOSA type and fused GPU kernels.
-
-Storage: INT8 -> int8, INT16 -> int16, INT32 -> int32, INT48 -> int64, BOOL -> int8 (0 / 1).
-An operator runs one of three ways, chosen per operator instance:
-  kernel       a k_<OP> method that reads and writes the stored types (RESCALE, MATMUL INT16 x INT16, CONV2D 1x1,
-               ADD, SUB, MUL, TABLE, REDUCE_SUM, the compares, GATHER); it returns None for an attribute combination
-               it does not cover
-  as stored    the int64 emulator's op_<OP> applied to the stored tensors unchanged, for operators whose result does
-               not depend on the element width (MINIMUM, MAXIMUM, SELECT, CLAMP, REDUCE_MAX and the shape operators)
-  fallback     the int64 emulator's op_<OP> on tensors widened to int64, its result narrowed to the stored type
-On a CPU device everything is the int64 emulator (the kernels are CUDA only).
-
-Fusion (fuse=True, the default): the trees of pointwise operators that fusion.plan finds run as one generated kernel
-each (kernels/fused.py); the members other than the root are not stored and `how` says "fused" for them. A hook is
-then called for the operators that ran on their own and for the roots only; a `keep` tensor is never fused away.
-
-REQUIRE counts: a kernel adds its counts into a row of one int64 buffer [rows, samples] that lives on the device for
-the whole run (Emulator._slot hands out the rows); the fallback operators queue device tensors as the int64 emulator
-does. Both are read once at the end of run().
-
-Interface and results are those of int64_ref.Emulator: run(), violations, graph_status().
-"""
+"""cu-tosa Emulator: the int64 emulator's results with tensors stored at their TOSA type, GPU kernels and fusion.
+How each operator runs (kernel / as stored / fallback / fused) and the limits: README.md."""
 import math
 
 import numpy as np
@@ -35,15 +15,15 @@ AS_STORED = frozenset(("MINIMUM", "MAXIMUM", "SELECT", "CLAMP", "REDUCE_MAX", "T
 
 class Emulator(Int64Emulator):
     def __init__(self, graph, device="cpu", check=True, mm_backend="intmm", verify_narrow=False, fuse=True):
-        """verify_narrow: check that every fallback result fits its stored type before narrowing it (a test aid; one
-        extra pass over each such tensor). fuse: run trees of pointwise operators as one kernel each."""
+        """verify_narrow: check that each fallback result fits its stored type (a test aid).
+        fuse: run each tree of pointwise operators as one generated kernel."""
         super().__init__(graph, device=device, check=check, mm_backend=mm_backend)
         self.native = self.device.type == "cuda"
         self.verify_narrow = verify_narrow
         self.fuse = fuse
-        self._plans = {}  # frozenset(keep) -> (units, absorbed, free_after) of fusion.plan
-        self.how = {}  # op index -> "kernel" / "stored" / "fallback" (filled by run)
-        self._prep = {}  # op index -> device tensors derived from the operator's constants (built on first use)
+        self._plans = {}
+        self.how = {}
+        self._prep = {}
         self._slots, self._cbuf = [], None
         if self.native:
             for n, t in list(self.consts.items()):
@@ -69,27 +49,24 @@ class Emulator(Int64Emulator):
 
     def _begin(self, samples):
         """reset the REQUIRE records for a run of `samples` samples."""
-        if samples > 65535:  # the samples are one axis of the kernels' launch grid
+        if samples > 65535:
             raise NotImplementedError(f"{samples} samples in one run (the kernels take at most 65535)")
         self.violations, self._pending, self.samples, self._slots = [], [], samples, []
-        rows = 2 * len(self.g.ops) + 1  # at most 2 counters per operator; the last row takes the unchecked counts
+        rows = 2 * len(self.g.ops) + 1  # <= 2 counters per operator, + 1 row for unchecked runs
         if self._cbuf is None or self._cbuf.numel() != rows * samples:
             self._cbuf = torch.zeros(rows * samples, dtype=torch.int64, device=self.device)
         else:
             self._cbuf.zero_()
 
     def _slot(self, o, msg, parts):
-        """-> the flat offset in self._cbuf of a new counter row for this REQUIRE: part p of the checked tensor adds to
-        offset + p. parts is self.samples, or 1 for a check that does not split by sample (its count then stands for
-        every sample, as in Int64Emulator._per_sample)."""
+        """-> offset of a new counter row in self._cbuf; part p of the checked tensor adds at offset + p."""
         if not self.check:
             return self._cbuf.numel() - self.samples
         self._slots.append((o.idx, o.op, msg, parts == self.samples))
         return (len(self._slots) - 1) * self.samples
 
     def _slot_records(self):
-        """the kernels' REQUIRE records of this run, zero counts included: [(op index, op, message, count)], count =
-        an int, or a list per sample when samples > 1. One transfer from the device."""
+        """-> [(op index, op, message, count or per-sample counts)], zero counts included, one device transfer."""
         if not self._slots:
             return []
         n = len(self._slots)
@@ -238,10 +215,8 @@ class Emulator(Int64Emulator):
 
     # -- fusion ------------------------------------------------------------------------------------------------------
     def _plan(self, keep, fuse):
-        """the plan of a run that keeps `keep`, from the graph alone: (absorbed: the operators that run inside another
-        one's unit, steps: [(operator, its unit or None, whether it reads a tensor computed from the graph inputs,
-        the tensors to drop after it)] for the operators that run, in order). Without fusion: no units, and the int64
-        emulator's last uses."""
+        """-> (absorbed {member idx: root idx}, steps [(op, unit or None, reads graph-input data, tensors to drop)]),
+        cached per (fuse, keep)."""
         key = (fuse, frozenset(keep))
         if key not in self._plans:
             from .fusion import plan
@@ -323,7 +298,7 @@ class Emulator(Int64Emulator):
                 if flags[1]:
                     checks.append((m, "TABLE slope outside INT16"))
             ops.append((m.op, flags, tuple(refs)))
-        # the tensor arguments in the kernel's order: tables first, then the per-channel pairs
+        # fused.source's argument order: tables, then per-channel pairs
         tables = [self.consts[m.inputs[1]].reshape(-1).contiguous() for m in u.members if m.op == "TABLE"]
         aux = tables + aux
         prog = (tuple(modes), tuple(ops))
@@ -331,7 +306,7 @@ class Emulator(Int64Emulator):
         assert params.numel() - 1 == fused.n_params(prog) and len(checks) == fused.n_counters(prog)
         root = u.members[-1].outputs[0]
         store = STORE[g.dtype(root)]
-        # every tensor of a run is stored at STORE of its declared type (the run loop checks it), the constants as loaded
+        # the launch trusts these types: _run keeps each tensor at STORE of its declared type
         types = (store, torch.int64, torch.int64,
                  *[self.consts[n].dtype if n in self.consts else STORE[g.dtype(n)] for n, _ in leaves],
                  *[t.dtype for t in aux])
@@ -341,17 +316,15 @@ class Emulator(Int64Emulator):
                     slots={per_part: [(m.idx, m.op, msg, per_part) for m, msg in checks] for per_part in (True, False)})
 
     def _run_unit(self, u, env):
-        """-> the root's stored result, or None when the checked members do not split into the same sample parts (the
-        unit then runs operator by operator). A sample count that does not split a checked member raises as in the
-        int64 emulator, but when the root runs: an operator on its own between that member and the root may raise
-        first, so the operator named in the error can differ."""
+        """-> the root's result, or None when checked members split into different sample parts (then op by op).
+        A sample count that splits no member raises when the root runs, so the error may name another operator."""
         from .kernels import fused
         prep = self._prep.get(u.key)  # by member set: a root has other members under another `keep`
         if prep is None:
             prep = self._prep[u.key] = self._unit_prep(u)
         mode = (self.samples, self.check)
         parts = prep["parts"].get(mode, 0)
-        if parts == 0:  # shapes only: the same for every run of this mode
+        if parts == 0:  # depends on shapes only
             self._from_inputs = True
             found = {self._parts(m, shape) for m, shape in prep["shapes"]}  # only the members with a REQUIRE split
             parts = prep["parts"][mode] = 1 if not found else found.pop() if len(found) == 1 else None
@@ -371,7 +344,7 @@ class Emulator(Int64Emulator):
 
     def _exec(self, o, env, from_inputs):
         """one operator on its own: kernel, as stored, or fallback. -> (outputs, how)."""
-        if o.op == "RESHAPE":  # op_RESHAPE with its constant shape read once
+        if o.op == "RESHAPE":  # constant shape read once
             shape = self._prep.get(o.idx)
             if shape is None and (o.inputs[1] in self.g.shapes or self.g.tensors[o.inputs[1]].data is not None):
                 shape = self._prep[o.idx] = tuple(int(v) for v in self._host(o.inputs[1]))
@@ -405,7 +378,7 @@ class Emulator(Int64Emulator):
             raise ValueError(f"graph has {len(g.inputs)} inputs, got {len(inputs)}")
         self._begin(samples)
         keep = set(keep) | set(g.outputs)
-        absorbed, steps = self._plan(keep, self.fuse and not self.faults)  # a fault names any operator
+        absorbed, steps = self._plan(keep, self.fuse and not self.faults)  # a fault may target an absorbed operator
         env = dict(self.consts)
         for name, x in zip(g.inputs, inputs):
             t = torch.as_tensor(np.asarray(x)) if not isinstance(x, torch.Tensor) else x
@@ -424,7 +397,7 @@ class Emulator(Int64Emulator):
                 if hook is not None:
                     hook(o, [y])
             else:
-                if u is not None:  # the unit, operator by operator
+                if u is not None:
                     inner = sorted(u.members[:-1] + u.reshapes, key=lambda m: m.idx)
                     for m in inner:
                         mo, how[m.idx] = self._exec(m, env, True)
@@ -448,7 +421,7 @@ class Emulator(Int64Emulator):
             for n in drop:
                 env.pop(n, None)
         self.env = {n: env[n] for n in keep if n in env}
-        records = self._slot_records()  # an operator is on one path, so its records keep their order in the sort
+        records = self._slot_records()  # stable sort: an operator's records stay in order
         if self._pending:
             counts = torch.stack([c for *_, c in self._pending]).cpu().tolist()
             records += [(i, op, msg, n) for (i, op, msg, _), n in zip(self._pending, counts)]

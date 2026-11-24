@@ -1,11 +1,6 @@
-"""The kernels one at a time against the int64 emulator's operator on the same tensors (CUDA).
-
-RESCALE: every real RESCALE operator of the given graphs that the kernel covers, grouped by signature (types, scale32,
-per channel), with inputs over the operator's declared input range and over a range that breaks its REQUIREs, as one
-sample and as 4 samples; outputs and both REQUIRE counts must be equal.
-MATMUL: INT16 x INT16 shapes against an exact int64 matmul on the CPU.
-usage: python tests/kernel_check.py name=graph.tosa ...
-"""
+"""Each kernel and fusion unit against the int64 emulator's operators on the same tensors: declared input range,
+a range that breaks the REQUIREs and small values, as 1 and several samples.
+usage: python tests/kernel_check.py name=graph.tosa ..."""
 import sys
 from collections import defaultdict
 
@@ -68,10 +63,7 @@ DATA = {"MUL": 2, "TABLE": 1, "CONV2D": 3}  # the operands that carry data; defa
 
 
 def replay_rows(name, path, per_sig, gen):
-    """real ADD / SUB / MUL / TABLE / REDUCE_SUM operators: constants as they are, the other inputs drawn over the
-    whole declared range, over 3/4 of it (some results overflow) and over small values (none do); the kernel against
-    the int64 emulator's operator on the widened tensors. Operators whose inputs all have one shape also run as 4
-    samples."""
+    """real ADD / SUB / MUL / TABLE / REDUCE_SUM operators: kernel vs int64 operator, inputs over three ranges."""
     g = TosaGraphIR(path)
     ref, cu = Int64Emulator(g, device="cuda"), Emulator(g, device="cuda")
     groups = defaultdict(list)
@@ -129,9 +121,7 @@ def replay_rows(name, path, per_sig, gen):
 
 
 def unit_rows(name, path, per_struct, gen):
-    """fusion units (cutosa/fusion.py): real units, grouped by kernel structure, with their leaves drawn over the
-    whole declared range, over 3/4 of it and over small values; the generated kernel against the int64 emulator's
-    operators applied member by member. Each also runs as several samples when a sample count divides every member."""
+    """real fusion units, one per kernel structure: generated kernel vs the int64 operators member by member."""
     from cutosa.fusion import plan
     g = TosaGraphIR(path)
     ref, cu = Int64Emulator(g, device="cuda"), Emulator(g, device="cuda")
@@ -181,8 +171,7 @@ def unit_rows(name, path, per_struct, gen):
 
 
 def linear_rows(gen):
-    """the 1x1 CONV2D kernel on synthetic operands against an exact int64 product: zero points, a bias that pushes
-    part of the accumulators out of the output type (wrap for INT32, saturation for INT48), 1 and 4 parts."""
+    """1x1 CONV2D on synthetic operands vs an exact int64 product: zero points, a bias that pushes past the type."""
     from cutosa.kernels.conv import linear
     rows = []
     for dt, out_dt, M, K, N, izp, wzp, big in (
