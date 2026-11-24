@@ -10,8 +10,8 @@ BLOCK = 1024
 
 
 @jit
-def _rescale(x_ptr, y_ptr, c_ptr, m_ptr, s_ptr, n_per: tl.int64, c0: tl.int64, c1: tl.int64, C: tl.int64,
-             izp: tl.int64, m: tl.int64, s: tl.int64, ozp: tl.int64, olo: tl.int64, ohi: tl.int64,
+def _rescale(x_ptr, y_ptr, c_ptr, m_ptr, s_ptr, n_per: tl.int64, c0: tl.int64, c1: tl.int64, C: tl.int64,  # pyright: ignore[reportInvalidTypeForm]
+             izp: tl.int64, m: tl.int64, s: tl.int64, ozp: tl.int64, olo: tl.int64, ohi: tl.int64,  # pyright: ignore[reportInvalidTypeForm]
              SCALE32: tl.constexpr, PER_CHANNEL: tl.constexpr, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
     sid = tl.program_id(1)
@@ -45,7 +45,7 @@ def _rescale(x_ptr, y_ptr, c_ptr, m_ptr, s_ptr, n_per: tl.int64, c0: tl.int64, c
         tl.atomic_add(c_ptr + c1 + sid, n1)
 
 
-def rescale(x, out_dtype, mult, shift, izp, ozp, olo, ohi, scale32, per_channel, cbuf, c0, c1, parts=1):
+def rescale(x, out_dtype, mult, shift, izp, ozp, olo, ohi, scale32, per_channel, cbuf, c0, c1, parts):
     """mult / shift: python ints, or int64 CUDA tensors of x.shape[-1] values (per_channel). Part p of `parts`
     equal parts of x adds its REQUIRE counts to cbuf[c0 + p] and cbuf[c1 + p]."""
     n_per = x.numel() // parts

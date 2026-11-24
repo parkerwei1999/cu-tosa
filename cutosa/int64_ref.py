@@ -3,13 +3,18 @@ oracle and fallback of cutosa.Emulator. Overflow as in the reference model: ADD 
 accumulators wrap, int48 accumulators saturate; REQUIRE failures go to Emulator.violations (graph_status())."""
 import importlib
 import inspect
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
+from enum import Enum
+from typing import NamedTuple
 
 import numpy as np
 import torch
 from tosa import Attribute as _attr_mod
 from tosa import DType, Op
 from tosa.TosaGraph import TosaGraph
+from tosa.TosaOperator import TosaOperator
+from tosa.TosaTensor import TosaTensor
 
 OP_NAMES = {v: k for k, v in vars(Op.Op).items() if not k.startswith("_")}
 DTYPE_NAMES = {v: k for k, v in vars(DType.DType).items() if not k.startswith("_")}
@@ -21,13 +26,47 @@ BITS = {"INT8": 8, "INT16": 16, "INT32": 32, "INT48": 48}
 NP_DTYPE = {"BOOL": np.bool_, "INT8": np.int8, "INT16": np.int16, "INT32": np.int32, "INT48": np.int64}
 ROUND_SINGLE, ROUND_INEXACT, ROUND_DOUBLE = 1, 2, 3  # tosa.RoundingMode
 VALID, UNPREDICTABLE = "VALID", "UNPREDICTABLE"  # reference-model GraphStatus names
-# REQUIREs the reference model does not check (an INT32 MUL with shift 0 keeps the low 32 bits): still VALID
-UNCHECKED_BY_REFERENCE = ("MUL result (shift 0)",)
+# The leading operands each op_<NAME> method receives as tensors (None: all); it reads the others by name as constants.
+DATA_OPERANDS: dict[str, int | None] = {
+    "ADD": 2, "SUB": 2, "MINIMUM": 2, "MAXIMUM": 2, "GREATER": 2, "GREATER_EQUAL": 2, "SELECT": 3, "CLAMP": 1,
+    "MUL": 2, "TABLE": 1, "RESCALE": 1, "REDUCE_SUM": 1, "REDUCE_MAX": 1, "MATMUL": 2, "CONV2D": 1,
+    "TRANSPOSE": 1, "RESHAPE": 1, "SLICE": 1, "CONCAT": None, "GATHER": 2}
 
 
-def graph_status(violations: list, sample: int | None = None) -> str:
+class Require(Enum):
+    ADD_RESULT = "ADD result outside {dt}"
+    SUB_RESULT = "SUB result outside {dt}"
+    MUL_RESULT_SHIFT0 = "MUL result (shift 0) outside {dt}"
+    MUL_RESULT = "MUL result (shift {shift}) outside {dt}"
+    MUL_SHIFT = "MUL shift != 0 for int8/int16 inputs"
+    TABLE_SLOPE = "TABLE slope outside INT16"
+    RESCALE_MULTIPLIER = "RESCALE multiplier < 0"
+    RESCALE_SHIFT = "RESCALE shift outside [2, 62]"
+    APPLY_SCALE_32 = "apply_scale_32 value outside [-2^(shift-1), 2^(shift-1))"
+    APPLY_SCALE_16 = "apply_scale_16 result outside INT32"
+    RESCALE_RESULT = "RESCALE result + output_zp outside INT32"
+    REDUCE_SUM = "REDUCE_SUM running sum outside {dt}"
+    ACC_INT32 = "int32 accumulator overflow (wrapped) outside INT32"
+    ACC_INT48 = "int48 accumulator (saturated) outside INT48"
+    GATHER_INDEX = "GATHER index outside [0, K)"
+
+    @property
+    def checked_by_reference(self) -> bool:
+        # the reference model keeps the low 32 bits of an INT32 MUL with shift 0: the graph stays VALID
+        return self is not Require.MUL_RESULT_SHIFT0
+
+
+class Violation(NamedTuple):
+    op_idx: int
+    op: str
+    require: Require
+    msg: str
+    failed: int | list[int]  # elements that failed; per sample (a list) after run(samples > 1)
+
+
+def graph_status(violations: list[Violation], sample: int | None = None) -> str:
     """UNPREDICTABLE if a REQUIRE that the reference model also checks failed (in `sample`, for a run over samples)."""
-    return UNPREDICTABLE if any(not v[2].startswith(UNCHECKED_BY_REFERENCE) and (sample is None or v[3][sample])
+    return UNPREDICTABLE if any(v.require.checked_by_reference and (sample is None or v.failed[sample])  # pyright: ignore[reportIndexIssue]
                                 for v in violations) else VALID
 
 
@@ -35,21 +74,21 @@ def graph_status(violations: list, sample: int | None = None) -> str:
 class TensorInfo:
     name: str
     dtype: str
-    shape: tuple
-    data: np.ndarray = None  # int64 values (constants only)
+    shape: tuple[int, ...]
+    data: np.ndarray | None = None  # int64 values (constants only)
 
 
 @dataclass
 class OpInfo:
     idx: int
     op: str
-    inputs: list
-    outputs: list
+    inputs: list[str]
+    outputs: list[str]
     attrs: dict = field(default_factory=dict)
 
 
-def _decode_const(t, dtype, shape):
-    raw = t.DataAsNumpy().tobytes()
+def _decode_const(t: TosaTensor, dtype: str, shape: tuple[int, ...]) -> np.ndarray:
+    raw = t.DataAsNumpy().tobytes()  # pyright: ignore[reportAttributeAccessIssue]
     if dtype == "INT48":  # 6 little-endian bytes per element, sign-extended from bit 47
         b = np.frombuffer(raw, np.uint8).reshape(-1, 6).astype(np.int64)
         v = np.zeros(b.shape[0], np.int64)
@@ -65,18 +104,18 @@ def _decode_const(t, dtype, shape):
         # ExecuTorch 1.x writes CONV2D weight_zp as an OC-long all-equal vector under the declared shape [1]
         v = v[:1]
     if v.size != n:
-        raise ValueError(f"const {t.Name().decode()}: {v.size} values for shape {shape}")
+        raise ValueError(f"const {t.Name().decode()}: {v.size} values for shape {shape}")  # pyright: ignore[reportOptionalMemberAccess]
     return v.reshape(shape)
 
 
-def _attr_values(o):
+def _attr_values(o: TosaOperator) -> dict:
     name = ATTR_NAMES.get(o.AttributeType(), "NONE")
     if name == "NONE" or o.Attribute() is None:
         return {}
     cls = getattr(importlib.import_module(f"tosa.{name}"), name)
     a = cls()
     tab = o.Attribute()
-    a.Init(tab.Bytes, tab.Pos)
+    a.Init(tab.Bytes, tab.Pos)  # pyright: ignore[reportOptionalMemberAccess]
     out = {}
     for meth, fn in inspect.getmembers(cls, inspect.isfunction):
         if meth.startswith(("_", "Init", "GetRootAs")) or meth.endswith(("Length", "IsNone", "AsNumpy")) \
@@ -94,44 +133,44 @@ def _attr_values(o):
 class TosaGraphIR:
     """Single-region / single-block TOSA 1.0 graph as python objects (tensors, shape constants, ops in file order)."""
 
-    def __init__(self, src):
+    def __init__(self, src: str | bytes | bytearray) -> None:
         buf = src if isinstance(src, (bytes, bytearray)) else open(src, "rb").read()
         self.raw = bytes(buf)
         g = TosaGraph.GetRootAsTosaGraph(self.raw, 0)
-        if g.RegionsLength() != 1 or g.Regions(0).BlocksLength() != 1:
+        if g.RegionsLength() != 1 or g.Regions(0).BlocksLength() != 1:  # pyright: ignore[reportOptionalMemberAccess]
             raise NotImplementedError("only single-region single-block graphs (no COND_IF / WHILE_LOOP)")
         v = g.Version()
-        self.version = (v._Major(), v._Minor(), v._Patch(), v._Draft())
-        blk = g.Regions(0).Blocks(0)
+        self.version = (v._Major(), v._Minor(), v._Patch(), v._Draft())  # pyright: ignore[reportOptionalMemberAccess]
+        blk = g.Regions(0).Blocks(0)  # pyright: ignore[reportOptionalMemberAccess]
         self.tensors = {}
-        for i in range(blk.TensorsLength()):
-            t = blk.Tensors(i)
-            name = t.Name().decode()
-            dt = DTYPE_NAMES.get(t.Type(), str(t.Type()))
-            shape = tuple(int(s) for s in t.ShapeAsNumpy()) if t.ShapeLength() else ()
-            if t.Variable():
+        for i in range(blk.TensorsLength()):  # pyright: ignore[reportOptionalMemberAccess]
+            t = blk.Tensors(i)  # pyright: ignore[reportOptionalMemberAccess]
+            name = t.Name().decode()  # pyright: ignore[reportOptionalMemberAccess]
+            dt = DTYPE_NAMES.get(t.Type(), str(t.Type()))  # pyright: ignore[reportOptionalMemberAccess]
+            shape = tuple(int(s) for s in t.ShapeAsNumpy()) if t.ShapeLength() else ()  # pyright: ignore[reportGeneralTypeIssues, reportOptionalMemberAccess]
+            if t.Variable():  # pyright: ignore[reportOptionalMemberAccess]
                 raise NotImplementedError(f"variable tensor {name}")
-            data = _decode_const(t, dt, shape) if t.DataLength() else None
+            data = _decode_const(t, dt, shape) if t.DataLength() else None  # pyright: ignore[reportArgumentType, reportOptionalMemberAccess]
             self.tensors[name] = TensorInfo(name, dt, shape, data)
         self.shapes = {}  # CONST_SHAPE values: name -> tuple of python ints
-        for i in range(blk.ShapesLength()):
-            s = blk.Shapes(i)
-            raw = s.DataAsNumpy().tobytes() if s.DataLength() else b""
-            self.shapes[s.Name().decode()] = tuple(int(x) for x in np.frombuffer(raw, "<i8"))
+        for i in range(blk.ShapesLength()):  # pyright: ignore[reportOptionalMemberAccess]
+            s = blk.Shapes(i)  # pyright: ignore[reportOptionalMemberAccess]
+            raw = s.DataAsNumpy().tobytes() if s.DataLength() else b""  # pyright: ignore[reportAttributeAccessIssue, reportOptionalMemberAccess]
+            self.shapes[s.Name().decode()] = tuple(int(x) for x in np.frombuffer(raw, "<i8"))  # pyright: ignore[reportOptionalMemberAccess]
         self.ops = []
-        for i in range(blk.OperatorsLength()):
-            o = blk.Operators(i)
-            self.ops.append(OpInfo(i, OP_NAMES.get(o.Op(), str(o.Op())),
-                                   [o.Inputs(j).decode() for j in range(o.InputsLength())],
-                                   [o.Outputs(j).decode() for j in range(o.OutputsLength())], _attr_values(o)))
-        self.inputs = [blk.Inputs(j).decode() for j in range(blk.InputsLength())]
-        self.outputs = [blk.Outputs(j).decode() for j in range(blk.OutputsLength())]
+        for i in range(blk.OperatorsLength()):  # pyright: ignore[reportOptionalMemberAccess]
+            o = blk.Operators(i)  # pyright: ignore[reportOptionalMemberAccess]
+            self.ops.append(OpInfo(i, OP_NAMES.get(o.Op(), str(o.Op())),  # pyright: ignore[reportOptionalMemberAccess]
+                                   [o.Inputs(j).decode() for j in range(o.InputsLength())],  # pyright: ignore[reportAttributeAccessIssue, reportOptionalMemberAccess]
+                                   [o.Outputs(j).decode() for j in range(o.OutputsLength())], _attr_values(o)))  # pyright: ignore[reportArgumentType, reportAttributeAccessIssue, reportOptionalMemberAccess]
+        self.inputs = [blk.Inputs(j).decode() for j in range(blk.InputsLength())]  # pyright: ignore[reportAttributeAccessIssue, reportOptionalMemberAccess]
+        self.outputs = [blk.Outputs(j).decode() for j in range(blk.OutputsLength())]  # pyright: ignore[reportAttributeAccessIssue, reportOptionalMemberAccess]
 
-    def dtype(self, name):
+    def dtype(self, name: str) -> str:
         return self.tensors[name].dtype if name in self.tensors else "SHAPE"
 
 
-def _limbs(x, nbits):
+def _limbs(x: torch.Tensor, nbits: int) -> tuple[list[torch.Tensor], int]:
     """x (nbits signed values) -> (int8 limbs, low first, c) with x == sum 256^i limb_i + c."""
     nl = (nbits + 7) // 8
     if nl == 1:
@@ -148,7 +187,7 @@ def _limbs(x, nbits):
 _CUDA_SLACK_ROWS = 256
 
 
-def _cuda_operand(x, rows, cols):
+def _cuda_operand(x: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
     """x zero-padded to [rows, cols], with _CUDA_SLACK_ROWS zero rows after it in the same allocation."""
     buf = torch.zeros(rows + _CUDA_SLACK_ROWS, cols, dtype=torch.int8, device=x.device)
     buf[:x.shape[0], :x.shape[1]] = x
@@ -160,7 +199,7 @@ def _cuda_operand(x, rows, cols):
 _CUDA_MAX_ROWS = 32768
 
 
-def _int_mm(a8, b8):
+def _int_mm(a8: torch.Tensor, b8: torch.Tensor) -> torch.Tensor:
     """int8 [M,K] x int8 [K,N] -> int64 [M,N] via torch._int_mm (int32 accumulation, exact for K < 2^17)."""
     m, k = a8.shape
     n = b8.shape[1]
@@ -171,18 +210,15 @@ def _int_mm(a8, b8):
         for r in range(0, m, _CUDA_MAX_ROWS):
             ab = a8[r:r + _CUDA_MAX_ROWS]
             mp = -(-ab.shape[0] // 32) * 32
-            out.append(torch._int_mm(_cuda_operand(ab, mp, kp), b)[:ab.shape[0], :n].to(torch.int64))
+            out.append(torch._int_mm(_cuda_operand(ab, mp, kp), b)[:ab.shape[0], :n].to(torch.int64))  # pyright: ignore[reportPrivateImportUsage]
         return torch.cat(out) if len(out) != 1 else out[0]
-    return torch._int_mm(a8.contiguous(), b8.contiguous()).to(torch.int64)
+    return torch._int_mm(a8.contiguous(), b8.contiguous()).to(torch.int64)  # pyright: ignore[reportPrivateImportUsage]
 
 
-def imatmul(a, b, a_bits, b_bits, a_zp=0, b_zp=0, backend="intmm"):
-    """exact sum_k (a - a_zp)(b - b_zp) as int64; a [M, K], b [K, N] hold a_bits / b_bits signed values.
-    backend "int64": plain torch.matmul (CPU only, an independent oracle)."""
+def imatmul(a: torch.Tensor, b: torch.Tensor, a_bits: int, b_bits: int, a_zp: int = 0, b_zp: int = 0) -> torch.Tensor:
+    """exact sum_k (a - a_zp)(b - b_zp) as int64; a [M, K], b [K, N] hold a_bits / b_bits signed values."""
     if a.shape[1] >= (1 << 17):
         raise NotImplementedError("K >= 2^17 would overflow the int32 _int_mm accumulator")
-    if backend == "int64":
-        return torch.matmul(a - a_zp, b - b_zp)
     la, ca = _limbs(a, a_bits)
     lb, cb = _limbs(b, b_bits)
     K = a.shape[1]
@@ -195,15 +231,15 @@ def imatmul(a, b, a_bits, b_bits, a_zp=0, b_zp=0, backend="intmm"):
             acc = p if acc is None else acc + p
     oa, ob = ca - a_zp, cb - b_zp  # (a - a_zp) = A' + oa with A' = sum 256^i limb_i = a - ca
     if ob:
-        acc = acc + ob * (a.sum(1, keepdim=True) - K * ca)
+        acc = acc + ob * (a.sum(1, keepdim=True) - K * ca)  # pyright: ignore[reportOptionalOperand]
     if oa:
-        acc = acc + oa * (b.sum(0, keepdim=True) - K * cb)
+        acc = acc + oa * (b.sum(0, keepdim=True) - K * cb)  # pyright: ignore[reportOptionalOperand]
     if oa and ob:
-        acc = acc + K * oa * ob
-    return acc
+        acc = acc + K * oa * ob  # pyright: ignore[reportOptionalOperand]
+    return acc  # pyright: ignore[reportReturnType]
 
 
-def ibmm(a, b, a_bits, b_bits, a_zp=0, b_zp=0):
+def ibmm(a: torch.Tensor, b: torch.Tensor, a_bits: int, b_bits: int, a_zp: int = 0, b_zp: int = 0) -> torch.Tensor:
     """imatmul over a batch [N, M, K] x [N, K, P] with one batched GEMM per limb pair (Swin-T window attention: 1824
     matrices per image). A limb product is < 2^14, so sums over K <= 1024 are exact in float32; float64 otherwise."""
     K = a.shape[-1]
@@ -219,29 +255,27 @@ def ibmm(a, b, a_bits, b_bits, a_zp=0, b_zp=0):
             acc = p if acc is None else acc + p
     oa, ob = ca - a_zp, cb - b_zp  # as imatmul, the sums over K along the batched axes
     if ob:
-        acc = acc + ob * (a.sum(2, keepdim=True) - K * ca)
+        acc = acc + ob * (a.sum(2, keepdim=True) - K * ca)  # pyright: ignore[reportOptionalOperand]
     if oa:
-        acc = acc + oa * (b.sum(1, keepdim=True) - K * cb)
+        acc = acc + oa * (b.sum(1, keepdim=True) - K * cb)  # pyright: ignore[reportOptionalOperand]
     if oa and ob:
-        acc = acc + K * oa * ob
-    return acc
+        acc = acc + K * oa * ob  # pyright: ignore[reportOptionalOperand]
+    return acc  # pyright: ignore[reportReturnType]
 
 
-def _wrap(x, bits):
+def _wrap(x: torch.Tensor, bits: int) -> torch.Tensor:
     """two's-complement wrap of int64 values to `bits` (what Eigen int32 arithmetic does on overflow)."""
     half = 1 << (bits - 1)
     return ((x + half) & ((1 << bits) - 1)) - half
 
 
 class Emulator:
-    def __init__(self, graph, device="cpu", check=True, mm_backend="intmm"):
+    def __init__(self, graph: TosaGraphIR | str | bytes | bytearray, device: str | torch.device) -> None:
         self.g = graph if isinstance(graph, TosaGraphIR) else TosaGraphIR(graph)
         self.device = torch.device(device)
-        self.check = check
-        self.mm_backend = mm_backend
         self.consts = {n: torch.from_numpy(t.data).to(self.device) for n, t in self.g.tensors.items()
                        if t.data is not None}
-        self.violations = []
+        self.violations: list[Violation] = []
         self.samples = 1
         self._from_inputs = True
         self.faults = {}  # test hook: op index -> f(outputs) -> perturbed outputs
@@ -250,7 +284,7 @@ class Emulator:
             for n in o.inputs:
                 self.last_use[n] = o.idx
 
-    def _per_sample(self, o, bad):
+    def _per_sample(self, o: OpInfo, bad: torch.Tensor) -> torch.Tensor:
         """bad -> int64 counts per sample: an op on graph-input data splits its outermost non-1 dimension into
         self.samples equal parts, which assumes the batch is that dimension's outermost factor (unchecked); an op on
         constants only, or a scalar check, counts for every sample."""
@@ -261,34 +295,35 @@ class Emulator:
                              f"that splits into {self.samples} samples")
         return bad.reshape(self.samples, -1).sum(1)
 
-    def _require(self, o, ok, msg):
+    def _require(self, o: OpInfo, ok: torch.Tensor | bool, req: Require) -> None:
         """ok: bool tensor or python bool."""
-        if not self.check:
-            return
         if self.samples > 1:
-            counts = self._per_sample(o, ~ok) if isinstance(ok, torch.Tensor) else torch.full((self.samples,), int(not ok))
+            counts = (self._per_sample(o, ~ok) if isinstance(ok, torch.Tensor)
+                      else torch.full((self.samples,), int(not ok)))
             if counts.any():
-                self.violations.append((o.idx, o.op, msg, counts.tolist()))
+                self.violations.append(Violation(o.idx, o.op, req, req.value, counts.tolist()))
         elif isinstance(ok, torch.Tensor):
             bad = int((~ok).sum())
             if bad:
-                self.violations.append((o.idx, o.op, msg, bad))
+                self.violations.append(Violation(o.idx, o.op, req, req.value, bad))
         elif not ok:
-            self.violations.append((o.idx, o.op, msg, 1))
+            self.violations.append(Violation(o.idx, o.op, req, req.value, 1))
 
-    def _count_bad(self, o, x, lo, hi, msg):
+    def _count_bad(self, o: OpInfo, x: torch.Tensor, lo: int | torch.Tensor, hi: int | torch.Tensor, req: Require,
+                   **fmt: object) -> None:
         """the elements of x outside [lo, hi]; on CUDA the count stays on the device until run() ends."""
-        if not self.check or x.numel() == 0:
+        if x.numel() == 0:
             return
+        msg = req.value.format(**fmt)
         if self.samples > 1:
             counts = self._per_sample(o, (x < lo) | (x > hi))
             if x.is_cuda:
-                self._pending.append((o.idx, o.op, msg, counts))
+                self._pending.append((o, req, msg, counts))
             elif counts.any():
-                self.violations.append((o.idx, o.op, msg, counts.tolist()))
+                self.violations.append(Violation(o.idx, o.op, req, msg, counts.tolist()))
             return
         if x.is_cuda:
-            self._pending.append((o.idx, o.op, msg, ((x < lo) | (x > hi)).sum()))
+            self._pending.append((o, req, msg, ((x < lo) | (x > hi)).sum()))
             return
         if not isinstance(lo, torch.Tensor) and not isinstance(hi, torch.Tensor):
             mn, mx = torch.aminmax(x)
@@ -296,19 +331,19 @@ class Emulator:
                 return
         bad = int(((x < lo) | (x > hi)).sum())
         if bad:
-            self.violations.append((o.idx, o.op, msg, bad))
+            self.violations.append(Violation(o.idx, o.op, req, msg, bad))
 
-    def _in_range(self, o, x, dt, what):
+    def _in_range(self, o: OpInfo, x: torch.Tensor, dt: str, req: Require, **fmt: object) -> None:
         lo, hi = RANGE[dt]
-        self._count_bad(o, x, lo, hi, f"{what} outside {dt}")
+        self._count_bad(o, x, lo, hi, req, dt=dt, **fmt)
 
-    def _scalar(self, name):
+    def _scalar(self, name: str) -> int:
         v = self.g.tensors[name].data
         if v is None or v.size != 1:
             raise NotImplementedError(f"{name}: expected a constant scalar (zero point / shift)")
         return int(v.reshape(-1)[0])
 
-    def _host(self, name):
+    def _host(self, name: str) -> np.ndarray:
         """a constant operand (shift, multiplier, zero point, shape) as host int64."""
         if name in self.g.shapes:
             return np.array(self.g.shapes[name], np.int64)
@@ -317,13 +352,23 @@ class Emulator:
             raise NotImplementedError(f"{name}: non-constant operand where a constant is required")
         return v
 
-    def run(self, inputs, hook=None, keep=(), samples=1):
+    def _const(self, o: OpInfo, j: int) -> torch.Tensor:
+        """input j of o on the device; it must be a constant (a TABLE table, a CONV2D weight or bias)."""
+        t = self.consts.get(o.inputs[j])
+        if t is None:
+            raise NotImplementedError(f"#{o.idx} {o.op}: input {j} ({o.inputs[j]}) is not a constant")
+        return t
+
+    def run(self, inputs: Sequence[np.ndarray | torch.Tensor],
+            hook: Callable[[OpInfo, list[torch.Tensor]], None] | None = None, keep: Iterable[str] = (),
+            samples: int = 1) -> list[np.ndarray]:
         """inputs: integer arrays in graph input order. hook(op, outs): after every non-constant op. keep: tensor names
         to leave in self.env. samples > 1: REQUIRE counts per sample of a graph lowered at that batch."""
         g = self.g
         if len(inputs) != len(g.inputs):
             raise ValueError(f"graph has {len(g.inputs)} inputs, got {len(inputs)}")
-        self.violations, self._pending, self.samples = [], [], samples
+        self.violations, self.samples = [], samples
+        self._pending: list[tuple[OpInfo, Require, str, torch.Tensor]] = []
         from_inputs = set(g.inputs)
         env = dict(self.consts)
         for name, x in zip(g.inputs, inputs):
@@ -339,7 +384,7 @@ class Emulator:
             fn = getattr(self, "op_" + o.op, None)
             if fn is None:
                 raise NotImplementedError(f"op {o.op} (#{o.idx})")
-            ins = [env.get(n) for n in o.inputs]
+            ins = [env.get(n) for n in o.inputs[:DATA_OPERANDS[o.op]]]
             self._from_inputs = any(n in from_inputs for n in o.inputs)
             if self._from_inputs:
                 from_inputs.update(o.outputs)
@@ -358,45 +403,46 @@ class Emulator:
                     env.pop(n, None)
         self.env = {n: env[n] for n in keep if n in env}
         if self._pending:
-            counts = torch.stack([c for *_, c in self._pending]).cpu().tolist()
-            self.violations += [(i, op, msg, n) for (i, op, msg, _), n in zip(self._pending, counts) if any(n)] \
-                if self.samples > 1 else [(i, op, msg, n) for (i, op, msg, _), n in zip(self._pending, counts) if n]
-            self.violations.sort(key=lambda v: v[0])
+            counts = torch.stack([t for *_, t in self._pending]).cpu().tolist()
+            self.violations += [Violation(o.idx, o.op, req, msg, n)
+                                for (o, req, msg, _), n in zip(self._pending, counts, strict=True)
+                                if (any(n) if self.samples > 1 else n)]
+            self.violations.sort(key=lambda v: v.op_idx)
             self._pending = []
         return [self.to_numpy(n, env[n]) for n in g.outputs]
 
-    def to_numpy(self, name, t):
+    def to_numpy(self, name: str, t: torch.Tensor) -> np.ndarray:
         # Native quantize/dequantize glue expects the reference runner's C-order output.
         return t.cpu().numpy().astype(NP_DTYPE[self.g.dtype(name)], order="C")
 
-    def _checked_wrap(self, o, r, what):
+    def _checked_wrap(self, o: OpInfo, r: torch.Tensor, req: Require, **fmt: object) -> torch.Tensor:
         """REQUIRE r within the output type, then wrap to its low bits (the reference model's result)."""
         dt = self.g.dtype(o.outputs[0])
-        self._in_range(o, r, dt, what)
+        self._in_range(o, r, dt, req, **fmt)
         return _wrap(r, BITS[dt])
 
-    def op_ADD(self, o, a, b):
-        return [self._checked_wrap(o, a + b, "ADD result")]
+    def op_ADD(self, o: OpInfo, a: torch.Tensor, b: torch.Tensor) -> list[torch.Tensor]:
+        return [self._checked_wrap(o, a + b, Require.ADD_RESULT)]
 
-    def op_SUB(self, o, a, b):
-        return [self._checked_wrap(o, a - b, "SUB result")]
+    def op_SUB(self, o: OpInfo, a: torch.Tensor, b: torch.Tensor) -> list[torch.Tensor]:
+        return [self._checked_wrap(o, a - b, Require.SUB_RESULT)]
 
-    def op_MINIMUM(self, o, a, b):
+    def op_MINIMUM(self, o: OpInfo, a: torch.Tensor, b: torch.Tensor) -> list[torch.Tensor]:
         return [torch.minimum(a, b)]
 
-    def op_MAXIMUM(self, o, a, b):
+    def op_MAXIMUM(self, o: OpInfo, a: torch.Tensor, b: torch.Tensor) -> list[torch.Tensor]:
         return [torch.maximum(a, b)]
 
-    def op_GREATER(self, o, a, b):
+    def op_GREATER(self, o: OpInfo, a: torch.Tensor, b: torch.Tensor) -> list[torch.Tensor]:
         return [(a > b).to(torch.int64)]
 
-    def op_GREATER_EQUAL(self, o, a, b):
+    def op_GREATER_EQUAL(self, o: OpInfo, a: torch.Tensor, b: torch.Tensor) -> list[torch.Tensor]:
         return [(a >= b).to(torch.int64)]
 
-    def op_SELECT(self, o, condition, a, b):
+    def op_SELECT(self, o: OpInfo, condition: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> list[torch.Tensor]:
         return [torch.where(condition.to(torch.bool), a, b)]
 
-    def op_CLAMP(self, o, x):
+    def op_CLAMP(self, o: OpInfo, x: torch.Tensor) -> list[torch.Tensor]:
         dt = self.g.dtype(o.inputs[0])
         if dt not in ("INT8", "INT16"):
             raise NotImplementedError(f"CLAMP input dtype {dt}")
@@ -406,7 +452,7 @@ class Emulator:
             raise ValueError("CLAMP maximum is smaller than minimum")
         return [x.clamp(lo, hi)]
 
-    def op_MUL(self, o, a, b, _shift):
+    def op_MUL(self, o: OpInfo, a: torch.Tensor, b: torch.Tensor) -> list[torch.Tensor]:
         shift = self._scalar(o.inputs[2])
         r = a * b  # |a*b| <= 2^62 for int32 operands: exact in int64
         if self.g.dtype(o.inputs[0]) == "INT32":
@@ -414,12 +460,12 @@ class Emulator:
                 r += 1 << (shift - 1)
                 r >>= shift
         elif shift != 0:
-            self._require(o, False, "MUL shift != 0 for int8/int16 inputs")
-        return [self._checked_wrap(o, r, f"MUL result (shift {shift})")]
+            self._require(o, False, Require.MUL_SHIFT)
+        return [self._checked_wrap(o, r, Require.MUL_RESULT if shift else Require.MUL_RESULT_SHIFT0, shift=shift)]
 
-    def op_TABLE(self, o, x, table):
+    def op_TABLE(self, o: OpInfo, x: torch.Tensor) -> list[torch.Tensor]:
         dt = self.g.dtype(o.inputs[0])
-        table = table.reshape(-1)
+        table = self._const(o, 1).reshape(-1)
         if dt == "INT8":
             return [table[x + 128]]
         if dt != "INT16":
@@ -428,17 +474,15 @@ class Emulator:
         idx = x >> 7  # 9-bit index, 7-bit fraction (TOSA apply_lookup_s)
         idx += 256
         frac = x & 0x7F
-        host_tab = self.g.tensors[o.inputs[1]].data
-        host_slope = None if host_tab is None else np.diff(host_tab.reshape(-1))
-        if self.check and (host_slope is None or ((host_slope < RANGE["INT16"][0]) |
-                                                  (host_slope > RANGE["INT16"][1])).any()):
+        host_slope = np.diff(self.g.tensors[o.inputs[1]].data.reshape(-1))
+        if ((host_slope < RANGE["INT16"][0]) | (host_slope > RANGE["INT16"][1])).any():
             bad = (tab_slope < RANGE["INT16"][0]) | (tab_slope > RANGE["INT16"][1])
-            self._count_bad(o, bad[idx].to(torch.int64), 0, 0, "TABLE slope outside INT16")
+            self._count_bad(o, bad[idx].to(torch.int64), 0, 0, Require.TABLE_SLOPE)
         out = table[idx] * 128  # a new tensor: with a rank-0 x, table[idx] is a view of the table constant
         out += tab_slope[idx] * frac
         return [out]
 
-    def op_RESCALE(self, o, x, _m, _s, _izp, _ozp):
+    def op_RESCALE(self, o: OpInfo, x: torch.Tensor) -> list[torch.Tensor]:
         a = o.attrs
         in_dt, out_dt = self.g.dtype(o.inputs[0]), self.g.dtype(o.outputs[0])
         mult, shift = self._host(o.inputs[1]).reshape(-1), self._host(o.inputs[2]).reshape(-1)
@@ -457,11 +501,11 @@ class Emulator:
         else:
             m, s = int(mult[0]), int(shift[0])
             half = 1 << (s - 1)
-        self._require(o, bool((mult >= 0).all()), "RESCALE multiplier < 0")
-        self._require(o, bool(((shift >= 2) & (shift <= 62)).all()), "RESCALE shift outside [2, 62]")
+        self._require(o, bool((mult >= 0).all()), Require.RESCALE_MULTIPLIER)
+        self._require(o, bool(((shift >= 2) & (shift <= 62)).all()), Require.RESCALE_SHIFT)
         r = v * m  # |v| < 2^48, |m| < 2^31 (and |v| < 2^32 when scale32): exact in int64
         if scale32:
-            self._count_bad(o, v, -half, half - 1, "apply_scale_32 value outside [-2^(shift-1), 2^(shift-1))")
+            self._count_bad(o, v, -half, half - 1, Require.APPLY_SCALE_32)
             if mode == ROUND_DOUBLE:
                 adj = torch.where(v >= 0, 1 << 30, -(1 << 30))
                 r += adj * (s > 31) if isinstance(s, torch.Tensor) else (adj if s > 31 else 0)
@@ -472,51 +516,47 @@ class Emulator:
         else:  # apply_scale_16 (value may be int48)
             r += half
             r >>= s
-            self._in_range(o, r, "INT32", "apply_scale_16 result")
+            self._in_range(o, r, "INT32", Require.APPLY_SCALE_16)
         if a["OutputUnsigned"]:
             r += ozp & ((1 << BITS[out_dt]) - 1)
             return [r.clamp_(0, (1 << BITS[out_dt]) - 1)]
         if ozp:
             r += ozp
-        self._in_range(o, r, "INT32", "RESCALE result + output_zp")
+        self._in_range(o, r, "INT32", Require.RESCALE_RESULT)
         lo, hi = RANGE[out_dt]
         return [r.clamp_(lo, hi)]
 
-    def op_REDUCE_SUM(self, o, x):
+    def op_REDUCE_SUM(self, o: OpInfo, x: torch.Tensor) -> list[torch.Tensor]:
         """REQUIRE on every running sum along the axis (TOSA apply_add_s), not only the total; the total wraps."""
         axis, dt = o.attrs["Axis"], self.g.dtype(o.outputs[0])
-        if self.check:
-            lo, hi = RANGE[dt]
-            run = x.cumsum(dim=axis)
-            bad = ((run < lo) | (run > hi)).any(dim=axis, keepdim=True)
-            self._count_bad(o, bad.to(torch.int64), 0, 0, f"REDUCE_SUM running sum outside {dt}")
+        lo, hi = RANGE[dt]
+        run = x.cumsum(dim=axis)
+        bad = ((run < lo) | (run > hi)).any(dim=axis, keepdim=True)
+        self._count_bad(o, bad.to(torch.int64), 0, 0, Require.REDUCE_SUM, dt=dt)
         return [_wrap(x.sum(dim=axis, keepdim=True), BITS[dt])]
 
-    def op_REDUCE_MAX(self, o, x):
+    def op_REDUCE_MAX(self, o: OpInfo, x: torch.Tensor) -> list[torch.Tensor]:
         return [x.amax(dim=o.attrs["Axis"], keepdim=True)]
 
-    def _acc_out(self, o, acc):
+    def _acc_out(self, o: OpInfo, acc: torch.Tensor) -> torch.Tensor:
         dt = self.g.dtype(o.outputs[0])
         if dt == "INT32":  # reference model: Eigen int32 accumulation -> wraps on overflow
-            self._in_range(o, acc, "INT32", "int32 accumulator overflow (wrapped)")
+            self._in_range(o, acc, "INT32", Require.ACC_INT32)
             return _wrap(acc, 32)
         if dt == "INT48":  # reference model: int64 accumulation, then saturate to int48
             lo, hi = RANGE["INT48"]
-            self._in_range(o, acc, "INT48", "int48 accumulator (saturated)")
+            self._in_range(o, acc, "INT48", Require.ACC_INT48)
             return acc.clamp(lo, hi)
         raise NotImplementedError(f"{o.op} output {dt}")
 
-    def op_MATMUL(self, o, A, B, _azp, _bzp):
+    def op_MATMUL(self, o: OpInfo, A: torch.Tensor, B: torch.Tensor) -> list[torch.Tensor]:
         azp, bzp = self._scalar(o.inputs[2]), self._scalar(o.inputs[3])
         abits, bbits = BITS[self.g.dtype(o.inputs[0])], BITS[self.g.dtype(o.inputs[1])]
-        if self.mm_backend == "int64":  # the independent oracle keeps one plain int64 matmul per batch entry
-            out = torch.stack([imatmul(A[n], B[n], abits, bbits, azp, bzp, "int64") for n in range(A.shape[0])])
-        else:
-            out = ibmm(A, B, abits, bbits, azp, bzp)
-        return [self._acc_out(o, out)]
+        return [self._acc_out(o, ibmm(A, B, abits, bbits, azp, bzp))]
 
-    def op_CONV2D(self, o, x, w, bias, _izp, _wzp):
+    def op_CONV2D(self, o: OpInfo, x: torch.Tensor) -> list[torch.Tensor]:
         a = o.attrs
+        w, bias = self._const(o, 1), self._const(o, 2)
         izp, wzp = self._scalar(o.inputs[3]), self._scalar(o.inputs[4])
         pt, pb, pl, pr = a["Pad"]
         sy, sx = a["Stride"]
@@ -537,26 +577,25 @@ class Emulator:
                     for ky in range(KH) for kx in range(KW)]
             cols = torch.stack(taps, dim=3).reshape(N * OH * OW, KH * KW * IC)
         wm = w.reshape(OC, KH * KW * IC).t()
-        acc = imatmul(cols, wm, BITS[self.g.dtype(o.inputs[0])], BITS[self.g.dtype(o.inputs[1])], izp, wzp,
-                      self.mm_backend)
+        acc = imatmul(cols, wm, BITS[self.g.dtype(o.inputs[0])], BITS[self.g.dtype(o.inputs[1])], izp, wzp)
         acc = acc + bias.reshape(1, -1)
         return [self._acc_out(o, acc.reshape(N, OH, OW, OC))]
 
-    def op_TRANSPOSE(self, o, x):
+    def op_TRANSPOSE(self, o: OpInfo, x: torch.Tensor) -> list[torch.Tensor]:
         return [x.permute(*o.attrs["Perms"])]
 
-    def op_RESHAPE(self, o, x, _shape):
+    def op_RESHAPE(self, o: OpInfo, x: torch.Tensor) -> list[torch.Tensor]:
         return [x.reshape(tuple(int(v) for v in self._host(o.inputs[1])))]
 
-    def op_SLICE(self, o, x, _start, _size):
+    def op_SLICE(self, o: OpInfo, x: torch.Tensor) -> list[torch.Tensor]:
         start, size = self._host(o.inputs[1]), self._host(o.inputs[2])
         return [x[tuple(slice(int(b), int(b) + int(n)) for b, n in zip(start, size))]]
 
-    def op_CONCAT(self, o, *xs):
+    def op_CONCAT(self, o: OpInfo, *xs: torch.Tensor) -> list[torch.Tensor]:
         return [torch.cat(xs, dim=o.attrs["Axis"])]
 
-    def op_GATHER(self, o, values, idx):
+    def op_GATHER(self, o: OpInfo, values: torch.Tensor, idx: torch.Tensor) -> list[torch.Tensor]:
         N, K, C = values.shape
-        self._count_bad(o, idx, 0, K - 1, "GATHER index outside [0, K)")
+        self._count_bad(o, idx, 0, K - 1, Require.GATHER_INDEX)
         idx = idx.clamp(0, K - 1)
         return [torch.gather(values, 1, idx.unsqueeze(-1).expand(N, idx.shape[1], C))]

@@ -34,7 +34,7 @@ class Kernel:
         Triton compile options, used at the first compile."""
         if types is None:
             types = tuple([a.dtype for a in args[:self.nptr]])
-        device = driver.active.get_current_device()
+        device = driver.active.get_current_device()  # pyright: ignore[reportAttributeAccessIssue]
         key = (device, types, consts)
         k = self._compiled.get(key)
         if k is None or _ENTER.calls or _EXIT.calls:  # profiler hooks only run on Triton's normal launch path
@@ -43,7 +43,7 @@ class Kernel:
                 self._compiled[key] = (c.run, c.function, c.packed_metadata)
             return
         g = len(grid)
-        k[0](grid[0], grid[1] if g > 1 else 1, grid[2] if g > 2 else 1, driver.active.get_current_stream(device),
+        k[0](grid[0], grid[1] if g > 1 else 1, grid[2] if g > 2 else 1, driver.active.get_current_stream(device),  # pyright: ignore[reportAttributeAccessIssue]
              k[1], k[2], None, None, None, *args, *consts)
 
 

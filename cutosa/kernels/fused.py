@@ -2,6 +2,7 @@
 REQUIRE is counted, and only the root's result is stored."""
 import hashlib
 import linecache
+from collections.abc import Callable
 
 import triton
 import triton.language as tl
@@ -9,28 +10,23 @@ import triton.language as tl
 from ._launch import jit
 
 BLOCK = 1024
-N_PARAMS = {"RESCALE": lambda f: 5 if f[1] else 6, "ADD": lambda f: 2, "SUB": lambda f: 2, "MUL": lambda f: 3}
-N_COUNTERS = {"RESCALE": lambda f: 2, "ADD": lambda f: 1, "SUB": lambda f: 1, "MUL": lambda f: 1,
-              "TABLE": lambda f: int(f[1])}
 _INT = {8: "tl.int8", 16: "tl.int16", 32: "tl.int32"}
 _kernels = {}
 
 
-def n_counters(prog):
-    return sum(N_COUNTERS[kind](flags) for kind, flags, _ in prog[1] if kind in N_COUNTERS)
+def source(prog: tuple, name: str) -> tuple[str, int, int]:
+    """-> (Triton source of the kernel for prog, number of int64 parameters it reads, number of counter rows).
 
-
-def n_params(prog):
-    return 2 * sum(m == "i" for m in prog[0]) + sum(N_PARAMS[k](f) for k, f, _ in prog[1] if k in N_PARAMS)
-
-
-def source(prog, name):
-    """Triton source of the kernel for prog = (leaf modes, ops); g = the output element index.
-    Leaf mode "f" reads x[g], "i" reads x[(g // inner) % n]. Op = (kind, flags, refs); ref "L<k>" = leaf k,
-    "V<j>" = result of op j. flags: RESCALE (scale32, per_channel), ADD / SUB / MUL (output bits,),
-    TABLE (wide, slope_check), others (). int64 params in order (lo, hi = the REQUIRE range): per "i" leaf inner,
-    n; RESCALE izp, mult, shift, ozp, lo, hi (per channel: izp, ozp, lo, hi, C); ADD / SUB lo, hi; MUL shift, lo,
-    hi. Tensor arguments after the leaves: the tables, then per-channel (mult, shift) pairs."""
+    prog = (modes, ops)                                    g = the output element index
+      modes[k]  "f": L<k> = x<k>[g]                        "i": L<k> = x<k>[(g // inner) % n]
+      ops[j]    (kind, flags, refs)                        refs: "L<k>" leaf k, "V<i>" the result of op i
+      flags     RESCALE (scale32, per_channel)   ADD / SUB / MUL (output bits,)   TABLE (wide, slope_check)
+    int64 parameters, in order (lo, hi: the REQUIRE range)
+      (inner, n) per "i" leaf, then per op:
+      RESCALE    izp, mult, shift, ozp, lo, hi             per channel: izp, ozp, lo, hi, C
+      ADD / SUB  lo, hi
+      MUL        shift, lo, hi
+    tensor arguments after the leaves: the TABLE tables, then the per-channel (mult, shift) pairs"""
     modes, ops = prog
     aux = [f"t{j}_ptr" for j, (k, f, _) in enumerate(ops) if k == "TABLE"] \
         + [a for j, (k, f, _) in enumerate(ops) if k == "RESCALE" and f[1] for a in (f"m{j}_ptr", f"s{j}_ptr")]
@@ -70,6 +66,7 @@ def source(prog, name):
                 izp, ozp, olo, ohi, C = par(), par(), par(), par(), par()
                 L.append(f"    ch{j} = g % {C}")
                 L.append(f"    mm{j} = tl.load(m{j}_ptr + ch{j}, mask=mask, other=0).to(tl.int64)")
+                # masked-off lanes read shift 2: with 0, one << (shift - 1) below would shift by -1, which is undefined
                 L.append(f"    ss{j} = tl.load(s{j}_ptr + ch{j}, mask=mask, other=2).to(tl.int64)")
             else:
                 izp, m, s, ozp, olo, ohi = par(), par(), par(), par(), par(), par()
@@ -113,25 +110,24 @@ def source(prog, name):
         else:
             raise ValueError(kind)
     L.append(f"    tl.store(y_ptr + g, V{len(ops) - 1}.to(y_ptr.dtype.element_ty), mask=mask)")
-    assert p == n_params(prog) and c == n_counters(prog)
-    return "\n".join(L) + "\n"
+    return "\n".join(L) + "\n", p, c
 
 
-def kernel(prog):
-    """the kernel of a structure, compiled once per process."""
-    fn = _kernels.get(prog)
-    if fn is None:
+def kernel(prog: tuple) -> tuple[Callable, int, int]:
+    """-> (kernel, number of int64 parameters, number of counter rows) of a structure, compiled once per process."""
+    compiled = _kernels.get(prog)
+    if compiled is None:
         name = "fused_" + hashlib.sha256(repr(prog).encode()).hexdigest()[:16]
-        src = source(prog, name)
+        src, n_params, n_counters = source(prog, name)
         filename = f"<cutosa {name}>"
         # Triton reads a kernel's source through inspect.getsource
         linecache.cache[filename] = (len(src), None, src.splitlines(True), filename)
         ns = {"jit": jit, "tl": tl}
         exec(compile(src, filename, "exec"), ns)
-        fn = _kernels[prog] = ns[name]
-    return fn
+        compiled = _kernels[prog] = (ns[name], n_params, n_counters)
+    return compiled
 
 
 def launch(k, types, y, cbuf, params, n_per, parts, cbase, cstride, leaves, aux):
-    """k: kernel(prog). types: the element types of (y, cbuf, params, *leaves, *aux)."""
+    """k: the kernel that kernel(prog) returns first. types: the element types of (y, cbuf, params, *leaves, *aux)."""
     k.launch((triton.cdiv(n_per, BLOCK), parts), (y, cbuf, params, *leaves, *aux, n_per, cbase, cstride), (BLOCK,), types)

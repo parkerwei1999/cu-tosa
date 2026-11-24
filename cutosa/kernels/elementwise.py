@@ -13,8 +13,8 @@ ADD, SUB, MUL = 0, 1, 2
 
 
 @jit
-def _binary(a_ptr, b_ptr, y_ptr, c_ptr, n_per: tl.int64, c0: tl.int64, ia: tl.int64, na: tl.int64, ib: tl.int64,
-            nb_b: tl.int64, shift: tl.int64, lo: tl.int64, hi: tl.int64,
+def _binary(a_ptr, b_ptr, y_ptr, c_ptr, n_per: tl.int64, c0: tl.int64, ia: tl.int64, na: tl.int64, ib: tl.int64,  # pyright: ignore[reportInvalidTypeForm]
+            nb_b: tl.int64, shift: tl.int64, lo: tl.int64, hi: tl.int64,  # pyright: ignore[reportInvalidTypeForm]
             OP: tl.constexpr, A_FLAT: tl.constexpr, B_FLAT: tl.constexpr, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
     sid = tl.program_id(1)
@@ -81,7 +81,7 @@ def _operand(x, shape):
     return x.contiguous(), inner, n, mode == "flat"
 
 
-def binary(op, a, b, out_dtype, lo, hi, cbuf, c0, shift=0, parts=1):
+def binary(op, a, b, out_dtype, lo, hi, cbuf, c0, shift, parts):
     """op: ADD / SUB / MUL; shift: MUL's rounding shift (0..62). -> y at out_dtype, the low bits of the exact result.
     Part p of `parts` equal parts adds its count of results outside [lo, hi] to cbuf[c0 + p]."""
     shape = broadcast_shape(a.shape, b.shape)
@@ -95,32 +95,51 @@ def binary(op, a, b, out_dtype, lo, hi, cbuf, c0, shift=0, parts=1):
 
 
 @jit
-def _table(x_ptr, t_ptr, y_ptr, n: tl.int64, WIDE: tl.constexpr, BLOCK: tl.constexpr):
-    """WIDE: INT16 input, 513 entries, INT32 output = entry * 128 + slope * (x & 127). Else INT8 input, 256 entries."""
+def _table_int8(x_ptr, t_ptr, y_ptr, n: tl.int64, BLOCK: tl.constexpr):  # pyright: ignore[reportInvalidTypeForm]
     offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < n
     x = tl.load(x_ptr + offs, mask=mask, other=0).to(tl.int32)
-    if WIDE:
-        idx = (x >> 7) + 256
-        base = tl.load(t_ptr + idx, mask=mask, other=0).to(tl.int32)
-        nxt = tl.load(t_ptr + idx + 1, mask=mask, other=0).to(tl.int32)
-        y = base * 128 + (nxt - base) * (x & 127)
-    else:
-        y = tl.load(t_ptr + x + 128, mask=mask, other=0)
-    tl.store(y_ptr + offs, y.to(y_ptr.dtype.element_ty), mask=mask)
+    tl.store(y_ptr + offs, tl.load(t_ptr + x + 128, mask=mask, other=0), mask=mask)
 
 
-def table(x, tab, out_dtype, wide):
+@jit
+def _table_int16(x_ptr, t_ptr, y_ptr, c_ptr, n_per: tl.int64, c0: tl.int64, BLOCK: tl.constexpr):  # pyright: ignore[reportInvalidTypeForm]
+    sid = tl.program_id(1)
+    offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n_per
+    g = sid.to(tl.int64) * n_per + offs
+    x = tl.load(x_ptr + g, mask=mask, other=0).to(tl.int32)
+    idx = (x >> 7) + 256
+    base = tl.load(t_ptr + idx, mask=mask, other=0).to(tl.int32)
+    slope = tl.load(t_ptr + idx + 1, mask=mask, other=0).to(tl.int32) - base
+    tl.store(y_ptr + g, base * 128 + slope * (x & 127), mask=mask)
+    n0 = tl.sum((((slope < -32768) | (slope > 32767)) & mask).to(tl.int64), axis=0)
+    if n0 > 0:
+        tl.atomic_add(c_ptr + c0 + sid, n0)
+
+
+def table_int8(x, tab):
+    """256 entries: y = tab[x + 128]."""
     x = x.contiguous()
     n = x.numel()
-    y = torch.empty(x.shape, dtype=out_dtype, device=x.device)
-    _table.launch((triton.cdiv(n, BLOCK),), (x, tab, y, n), (wide, BLOCK))
+    y = torch.empty(x.shape, dtype=torch.int8, device=x.device)
+    _table_int8.launch((triton.cdiv(n, BLOCK),), (x, tab, y, n), (BLOCK,))
+    return y
+
+
+def table_int16(x, tab, cbuf, c0, parts):
+    """513 entries: y (INT32) = entry * 128 + slope * (x & 127), entry = tab[(x >> 7) + 256], slope = the next entry -
+    entry. Part p of `parts` equal parts adds its count of elements whose slope is outside INT16 to cbuf[c0 + p]."""
+    x = x.contiguous()
+    n_per = x.numel() // parts
+    y = torch.empty(x.shape, dtype=torch.int32, device=x.device)
+    _table_int16.launch((triton.cdiv(n_per, BLOCK), parts), (x, tab, y, cbuf, n_per, c0), (BLOCK,))
     return y
 
 
 @jit
-def _reduce_sum(x_ptr, y_ptr, c_ptr, n_per: tl.int64, c0: tl.int64, L: tl.int64, inner: tl.int64, lo: tl.int64,
-                hi: tl.int64, BLOCK: tl.constexpr):
+def _reduce_sum(x_ptr, y_ptr, c_ptr, n_per: tl.int64, c0: tl.int64, L: tl.int64, inner: tl.int64, lo: tl.int64,  # pyright: ignore[reportInvalidTypeForm]
+                hi: tl.int64, BLOCK: tl.constexpr):  # pyright: ignore[reportInvalidTypeForm]
     """sum over an axis that is not the last; sequential because the REQUIRE is on every running sum (an output
     counts once if any of its running sums is outside [lo, hi])."""
     pid = tl.program_id(0)
@@ -141,7 +160,7 @@ def _reduce_sum(x_ptr, y_ptr, c_ptr, n_per: tl.int64, c0: tl.int64, L: tl.int64,
 
 
 @jit
-def _reduce_sum_last(x_ptr, y_ptr, c_ptr, n_per: tl.int64, c0: tl.int64, L: tl.int64, lo: tl.int64, hi: tl.int64,
+def _reduce_sum_last(x_ptr, y_ptr, c_ptr, n_per: tl.int64, c0: tl.int64, L: tl.int64, lo: tl.int64, hi: tl.int64,  # pyright: ignore[reportInvalidTypeForm]
                      BJ: tl.constexpr, BK: tl.constexpr):
     """the same over the last axis, in BJ x BK tiles: running sums = the carried sum + a cumsum inside the tile."""
     pid = tl.program_id(0)
@@ -164,7 +183,7 @@ def _reduce_sum_last(x_ptr, y_ptr, c_ptr, n_per: tl.int64, c0: tl.int64, L: tl.i
         tl.atomic_add(c_ptr + c0 + sid, n0)
 
 
-def reduce_sum(x, axis, out_dtype, lo, hi, cbuf, c0, parts=1):
+def reduce_sum(x, axis, out_dtype, lo, hi, cbuf, c0, parts):
     """Returns y = the sum over `axis` kept as a dimension of 1, at out_dtype; REQUIRE counts as in binary()."""
     x = x.contiguous()
     L = x.shape[axis]

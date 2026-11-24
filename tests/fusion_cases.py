@@ -1,5 +1,5 @@
 """Fusion on synthetic and random graphs: fused and unfused cu-tosa vs the int64 emulator at several sample
-counts, check on and off; outputs, violations and kept tensors equal, or the same exception type.
+counts; outputs, violations and kept tensors equal, or the same exception type.
 usage: python tests/fusion_cases.py [--random 30] [--seed 0]"""
 import argparse
 import sys
@@ -144,19 +144,18 @@ def differ(a, b):
 
 
 def check_graph(label, bd, samples=(1, 2, 3), keeps=((),), min_fused=1):
-    """every (samples, check) on fresh objects, then the `keeps` sequence on one object. -> (ok, text)."""
+    """every sample count on fresh objects, then the `keeps` sequence on one object. -> (ok, text)."""
     buf, problems, fused, viol = bd.serialize(), [], 0, 0
-    for check in (True, False):
-        for s in samples:
-            ref = run(Int64Emulator(TosaGraphIR(buf), device="cuda", check=check), bd.feeds, samples=s)
-            for fuse in (True, False):
-                cu = Emulator(TosaGraphIR(buf), device="cuda", check=check, fuse=fuse)
-                d = differ(ref, run(cu, bd.feeds, samples=s))
-                if d:
-                    problems.append(f"samples {s} check {check} fuse {fuse}: {d}")
-                if fuse and ref[0] == "ok":
-                    fused = max(fused, sum(v == "fused" for v in cu.how.values()))
-            viol += len(ref[2]) if ref[0] == "ok" else 0
+    for s in samples:
+        ref = run(Int64Emulator(TosaGraphIR(buf), device="cuda"), bd.feeds, samples=s)
+        for fuse in (True, False):
+            cu = Emulator(TosaGraphIR(buf), device="cuda", fuse=fuse)
+            d = differ(ref, run(cu, bd.feeds, samples=s))
+            if d:
+                problems.append(f"samples {s} fuse {fuse}: {d}")
+            if fuse and ref[0] == "ok":
+                fused = max(fused, sum(v == "fused" for v in cu.how.values()))
+        viol += len(ref[2]) if ref[0] == "ok" else 0
     one, ref = Emulator(TosaGraphIR(buf), device="cuda"), Int64Emulator(TosaGraphIR(buf), device="cuda")
     for keep in keeps:
         d = differ(run(ref, bd.feeds, keep=keep), run(one, bd.feeds, keep=keep))
@@ -268,6 +267,24 @@ def case_table_rank0(rng):
     return b, dict(samples=(1,), min_fused=0)
 
 
+def case_scalar_unit(rng):
+    """a unit of scalars: one count for the whole tensor, given to every sample."""
+    b = Builder()
+    x = b.inp(np.array(rng.integers(2**31 - 1000, 2**31)), "INT32")
+    a = b.bin("ADD", x, b.const(np.array(1000), "INT32"))  # wraps in INT32
+    b.out(b.rescale(a, "INT16", 1 << 30, 40))
+    return b, dict(samples=(1, 2, 4))
+
+
+def case_scalar_in_one_element_unit(rng):
+    """a scalar member under a (1, 1) root: with samples > 1 the root cannot split, and both emulators raise."""
+    b = Builder()
+    x = b.inp(np.array(rng.integers(2**31 - 1000, 2**31)), "INT32")
+    a = b.bin("ADD", x, b.const(np.array(1000), "INT32"))
+    b.out(b.rescale(b.reshape(a, (1, 1)), "INT16", 1 << 30, 40))
+    return b, dict(samples=(1, 2))
+
+
 def case_between(rng):
     """a unit whose members sit around an operator that runs on its own (record order)."""
     b = Builder()
@@ -356,7 +373,8 @@ def main(args):
     rng = np.random.default_rng(args.seed)
     results = []
     for case in (case_keep_sets, case_no_require, case_operand_twice, case_reshape_inside, case_broadcast,
-                 case_per_channel, case_wrap, case_table_slope, case_table_rank0, case_between):
+                 case_per_channel, case_wrap, case_table_slope, case_table_rank0, case_scalar_unit,
+                 case_scalar_in_one_element_unit, case_between):
         bd, kw = case(rng)
         results.append(check_graph(case.__name__.removeprefix("case_"), bd, **kw))
         print(("ok   " if results[-1][0] else "FAIL ") + results[-1][1], flush=True)

@@ -17,9 +17,9 @@ Tensors are stored at their TOSA type (INT8 / INT16 / INT32 natively, INT48 in i
 
 | path | operators | what happens |
 |---|---|---|
-| kernel | RESCALE (single rounding, signed, scalar or per channel), MATMUL INT16 x INT16, CONV2D 1x1 (stride 1, no padding), ADD, SUB, MUL, TABLE, REDUCE_SUM, GREATER, GREATER_EQUAL, GATHER | one fused Triton kernel reads and writes the stored types |
-| stored | MINIMUM, MAXIMUM, SELECT, CLAMP, REDUCE_MAX, TRANSPOSE, RESHAPE, SLICE, CONCAT | the int64 emulator's method directly on the int8 / int16 tensors, no widening (the result does not depend on the width) |
-| fallback | other CONV2D, MATMUL of other types, and any attribute combination a kernel declines (double rounding, unsigned RESCALE, a TABLE whose slope REQUIRE can fail) | widen to int64, run the int64 emulator's method, narrow |
+| `kernel` | RESCALE (single rounding, signed, scalar or per channel), MATMUL INT16 x INT16, CONV2D 1x1 (stride 1, no padding), ADD, SUB, MUL, TABLE, REDUCE_SUM, GREATER, GREATER_EQUAL, GATHER | one fused Triton kernel reads and writes the stored types |
+| `method` | MINIMUM, MAXIMUM, SELECT, CLAMP, REDUCE_MAX, TRANSPOSE, RESHAPE, SLICE, CONCAT | the int64 emulator's method directly on the int8 / int16 tensors, no widening (the result does not depend on the width) |
+| `method_i64` | other CONV2D, MATMUL of other types, and any attribute combination a kernel declines (double rounding, unsigned RESCALE, a TABLE whose slope REQUIRE can fail) | widen to int64, run the int64 emulator's method, narrow |
 
 With fusion (the default; `Emulator(fuse=False)` turns it off) the pointwise operators (RESCALE, ADD, SUB, MUL,
 TABLE, MINIMUM, MAXIMUM, GREATER, GREATER_EQUAL, SELECT) that read data do not run one by one: `cutosa/fusion.py`
@@ -44,7 +44,7 @@ These stop a run with an exception; none gives a wrong result.
   they raise `NotImplementedError`. The same bits passed as int8 work.
 - More than 65535 samples in one `run(samples=n)` (the samples are an axis of the kernels' launch grid).
 - A kernel's own shape limits (MATMUL / CONV2D: K <= 65280, batch <= 65535, fewer than 2^31 elements per operand)
-  are not limits of the emulator: such an operator takes the fallback.
+  are not limits of the emulator: such an operator runs as `method_i64`.
 
 ## Tests (CUDA)
 

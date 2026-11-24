@@ -7,6 +7,7 @@ from collections import defaultdict
 import torch
 
 from cutosa import RANGE, STORE, Emulator, Int64Emulator, TosaGraphIR
+from cutosa.int64_ref import DATA_OPERANDS
 from cutosa.kernels.matmul import bmm_i16
 
 
@@ -44,14 +45,14 @@ def rescale_rows(name, path, per_sig, gen):
                 x = x.cuda()
                 fits = RANGE[in_dt][0] <= lo and hi <= RANGE[in_dt][1]
                 begin(ref, cu, samples)
-                want = ref.op_RESCALE(o, x, None, None, None, None)[0]
+                want = ref.op_RESCALE(o, x)[0]
                 # a wide draw does not fit the stored input type: feed the kernel int64 storage for it
-                got = cu.k_RESCALE(o, x.to(STORE[in_dt]) if fits else x, None, None, None, None)
+                got = cu.k_RESCALE(o, x.to(STORE[in_dt]) if fits else x)
                 if got is None:
                     rows.append((name, o.idx, sig, label, "not covered by the kernel", True))
                     continue
-                wc = [(m, c.tolist()) for _, _, m, c in ref._pending]
-                gc = [(m, c) for _, _, m, c in cu._require_count_records()]
+                wc = [(msg, t.tolist()) for _, _, msg, t in ref._pending]
+                gc = [(v.msg, v.failed) for v in cu._require_count_records()]
                 ok = bool(torch.equal(got[0].to(torch.int64), want)) and wc == gc and got[0].dtype == STORE[sig[1]]
                 nbad = sum(sum(c) if isinstance(c, list) else c for _, c in wc)
                 rows.append((name, o.idx, sig, f"{label}, {x.numel()} el, {nbad} REQUIRE failures", ok))
@@ -59,7 +60,6 @@ def rescale_rows(name, path, per_sig, gen):
 
 
 REPLAY = ("ADD", "SUB", "MUL", "TABLE", "REDUCE_SUM", "CONV2D")
-DATA = {"MUL": 2, "TABLE": 1, "CONV2D": 3}  # the operands that carry data; default all
 
 
 def replay_rows(name, path, per_sig, gen):
@@ -69,7 +69,7 @@ def replay_rows(name, path, per_sig, gen):
     groups = defaultdict(list)
     for o in g.ops:
         if o.op in REPLAY:
-            data = o.inputs[:DATA.get(o.op, len(o.inputs))]
+            data = o.inputs[:DATA_OPERANDS[o.op]]
             sig = (o.op, tuple(g.dtype(n) for n in data), tuple("const" if g.tensors[n].data is not None else
                    "x".join(str(int(d != 1)) for d in g.tensors[n].shape) for n in data),
                    o.attrs.get("Axis"), ref._scalar(o.inputs[2]) > 0 if o.op == "MUL" else None)
@@ -77,15 +77,15 @@ def replay_rows(name, path, per_sig, gen):
     rows = []
     for sig, ops in sorted(groups.items(), key=str):
         for o in ops[:: max(1, len(ops) // per_sig)][:per_sig]:
-            data = o.inputs[:DATA.get(o.op, len(o.inputs))]
+            data = o.inputs[:DATA_OPERANDS[o.op]]
             var = [n for n in data if g.tensors[n].data is None]
             shapes = {g.tensors[n].shape for n in var}
-            x4 = len(shapes) == 1 and (len(var) == len(data) or o.op == "CONV2D") and len(next(iter(shapes))) > 0 \
+            x4 = len(shapes) == 1 and len(var) == len(data) and len(next(iter(shapes))) > 0 \
                 and o.op != "TABLE" and not (o.op == "CONV2D" and all(d == 1 for d in next(iter(shapes))[:3]))
             for draw in ("full", "3/4", "small") + (("3/4 x4",) if x4 else ()):
                 samples, wide, narrow = (4 if draw.endswith("x4") else 1), [], []
-                for n in o.inputs:
-                    if n in cu.consts or n not in data:
+                for n in data:
+                    if n in cu.consts:
                         wide.append(ref.consts.get(n))
                         narrow.append(cu.consts.get(n))
                         continue
@@ -109,8 +109,8 @@ def replay_rows(name, path, per_sig, gen):
                 if got is None:
                     rows.append((name, o.idx, sig, f"{draw}: not covered by the kernel", True))
                     continue
-                wc = [(m, c.tolist()) for _, _, m, c in ref._pending]
-                gc = [(m, c) for _, _, m, c in cu._require_count_records()]
+                wc = [(msg, t.tolist()) for _, _, msg, t in ref._pending]
+                gc = [(v.msg, v.failed) for v in cu._require_count_records()]
                 wc = [(m, c) for m, c in wc if (any(c) if isinstance(c, list) else c)]  # run() drops zero counts
                 gc = [(m, c) for m, c in gc if (any(c) if isinstance(c, list) else c)]
                 ok = bool(torch.equal(got[0].to(torch.int64), want)) and wc == gc \
@@ -128,7 +128,7 @@ def unit_rows(name, path, per_struct, gen):
     units, _ = plan(g)
     groups = defaultdict(list)
     for u in units.values():
-        groups[cu._unit_prep(u)["prog"]].append(u)
+        groups[cu._compile_unit(u).prog].append(u)
     rows = []
     for prog, us in sorted(groups.items(), key=str):
         label = " ".join(k for k, _, _ in prog[1])
@@ -153,14 +153,15 @@ def unit_rows(name, path, per_struct, gen):
                     wide[n], narrow[n] = x.cuda(), x.to(STORE[g.dtype(n)]).cuda()
                 begin(ref, cu, samples)
                 for m in sorted(u.members + u.reshapes, key=lambda m: m.idx):
-                    wide[m.outputs[0]] = getattr(ref, "op_" + m.op)(m, *[wide.get(n) for n in m.inputs])[0]
+                    data = [wide[n] for n in m.inputs[:DATA_OPERANDS[m.op]]]
+                    wide[m.outputs[0]] = getattr(ref, "op_" + m.op)(m, *data)[0]
                 want = wide[u.root.outputs[0]]
                 got = cu._run_unit(u, narrow)
                 if got is None:
                     rows.append((name, u.root.idx, label, f"{draw}: not run as a unit", True))
                     continue
-                wc = [(i, m_, c.tolist()) for i, _, m_, c in ref._pending]
-                gc = [(i, m_, c) for i, _, m_, c in cu._require_count_records()]
+                wc = [(op.idx, msg, t.tolist()) for op, _, msg, t in ref._pending]
+                gc = [(v.op_idx, v.msg, v.failed) for v in cu._require_count_records()]
                 nz = lambda rs: sorted((i, m_, c) for i, m_, c in rs if (any(c) if isinstance(c, list) else c))
                 ok = bool(torch.equal(got.to(torch.int64), want)) and nz(wc) == nz(gc) \
                     and got.dtype == STORE[g.dtype(u.root.outputs[0])]

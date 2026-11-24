@@ -10,8 +10,8 @@ MAX_K = 65280  # the largest K whose int32 row sums of an INT16 input cannot ove
 
 
 @jit
-def _linear(x_ptr, w_ptr, y_ptr, c_ptr, bias_ptr, wsum_ptr, M_per: tl.int64, N: tl.int64, K: tl.int64, c0: tl.int64,
-            izp: tl.int64, wzp: tl.int64, lo: tl.int64, hi: tl.int64,
+def _linear(x_ptr, w_ptr, y_ptr, c_ptr, bias_ptr, wsum_ptr, M_per: tl.int64, N: tl.int64, K: tl.int64, c0: tl.int64,  # pyright: ignore[reportInvalidTypeForm]
+            izp: tl.int64, wzp: tl.int64, lo: tl.int64, hi: tl.int64,  # pyright: ignore[reportInvalidTypeForm]
             WIDE: tl.constexpr, SAT: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
     pid_m, pid_n, sid = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     rm = pid_m * BM + tl.arange(0, BM)
@@ -58,7 +58,7 @@ def _linear(x_ptr, w_ptr, y_ptr, c_ptr, bias_ptr, wsum_ptr, M_per: tl.int64, N: 
         tl.atomic_add(c_ptr + c0 + sid, n0)
 
 
-def linear(x, w, bias64, wsum64, out_dtype, izp, wzp, lo, hi, saturate, cbuf, c0, parts=1):
+def linear(x, w, bias64, wsum64, out_dtype, izp, wzp, lo, hi, saturate, cbuf, c0, parts):
     """x [M, K] int8 or int16, w [N, K] int8, bias64 and wsum64 (sum_k w) int64 [N] -> y [M, N] at out_dtype.
     Part p of `parts` equal row ranges adds its count of accumulators outside [lo, hi] to cbuf[c0 + p]."""
     M, K = x.shape

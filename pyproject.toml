@@ -10,3 +10,7 @@ packages = ["cutosa", "cutosa.kernels"]
 
 [tool.ruff]
 line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "ARG"]
+dummy-variable-rgx = "^_$"

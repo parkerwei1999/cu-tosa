@@ -16,8 +16,8 @@ def fits(Bn, M, K, N):
 
 
 @jit
-def _bmm_i16(a_ptr, b_ptr, c_ptr, M: tl.int64, N: tl.int64, K: tl.int64, sab: tl.int64, sam: tl.int64, sak: tl.int64,
-             sbb: tl.int64, sbk: tl.int64, sbn: tl.int64, scb: tl.int64, scm: tl.int64, scn: tl.int64,
+def _bmm_i16(a_ptr, b_ptr, c_ptr, M: tl.int64, N: tl.int64, K: tl.int64, sab: tl.int64, sam: tl.int64, sak: tl.int64,  # pyright: ignore[reportInvalidTypeForm]
+             sbb: tl.int64, sbk: tl.int64, sbn: tl.int64, scb: tl.int64, scm: tl.int64, scn: tl.int64,  # pyright: ignore[reportInvalidTypeForm]
              BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
     """c[b, m, n] = sum_k a[b, m, k] * b[b, k, n], exact. A padded element loads 128: both limbs 0, x - 128 = 0."""
     pid_m, pid_n, pid_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)

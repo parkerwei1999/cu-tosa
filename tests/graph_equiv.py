@@ -79,7 +79,7 @@ def main(args):
                              [v for v in want_v if v not in cu.violations][:2])
                 ok &= all(a.dtype == b.dtype and np.array_equal(a, b) for a, b in zip(want, got)) and first is None
             nviol += len(want_v)
-        how = Counter(arms["fused"].how.values())
+        how = {str(k): v for k, v in Counter(arms["fused"].how.values()).items()}
         f = feeds(g, 5, rng)
         t = {"int64": timed(ref, f, args.reps)}
         for arm in ("unfused", "fused"):
@@ -88,7 +88,7 @@ def main(args):
             t[arm] = timed(fast, f, args.reps)
             del fast
         print(f"{'ok  ' if ok else 'FAIL'} {name}: {args.trials} input sets, {nviol} violation records equal, "
-              f"ops {dict(how)}, int64 {t['int64'] * 1e3:.0f} ms, unfused {t['unfused'] * 1e3:.0f} ms, cu-tosa "
+              f"ops {how}, int64 {t['int64'] * 1e3:.0f} ms, unfused {t['unfused'] * 1e3:.0f} ms, cu-tosa "
               f"{t['fused'] * 1e3:.0f} ms ({t['int64'] / t['fused']:.2f}x)"
               + (f", first difference (arm, input set, op, name): {first}" if first else ""), flush=True)
         ok_all &= ok
