@@ -76,5 +76,5 @@ The line `[cu-tosa overlay] ...` on stderr confirms the replacement. This is a t
 
 ## `cutosa/int64_ref.py`
 
-A verbatim copy of `fine_grained_transformer_u85/tosa_exec/tosa_emu.py` of the MLEK-Transformer kit at commit af62dd1.
+A verbatim copy of `fine_grained_transformer_u85/tosa_exec/tosa_emu.py` of the MLEK-Transformer kit at commit 47dd6e5.
 Keep it byte-identical to its source until the kit imports it from here; `cmp` the two files to check.

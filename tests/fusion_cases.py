@@ -169,6 +169,10 @@ def check_graph(label, bd, samples=(1, 2, 3), keeps=((),), min_fused=1):
         d = differ(run(ref, bd.feeds, keep=keep), run(one, bd.feeds, keep=keep))
         if d:
             problems.append(f"one object, keep {keep}: {d}")
+    for name, emu in (("int64", ref), ("cu-tosa", one)):  # a run leaves nothing behind in the object
+        d = differ(run(emu, bd.feeds), run(emu, bd.feeds))
+        if d:
+            problems.append(f"one {name} object, two runs: {d}")
     if fused < min_fused:
         problems.append(f"only {fused} operators ran fused")
     return not problems, f"{label}: {fused} operators fused, {viol} violation records" + "".join(
@@ -263,6 +267,14 @@ def case_table_slope(rng):
     return b, dict(samples=(1, 2, 4))
 
 
+def case_table_rank0(rng):
+    """INT16 TABLE of a rank-0 input: indexing the table with a rank-0 index gives a view of the constant."""
+    b = Builder()
+    x = b.inp(np.array(1000), "INT16")
+    b.out(b.table(x, np.arange(513) * 10 - 2000))
+    return b, dict(samples=(1,), min_fused=0)
+
+
 def case_between(rng):
     """a unit whose members sit around an operator that runs on its own (record order)."""
     b = Builder()
@@ -352,7 +364,7 @@ def main(args):
     rng = np.random.default_rng(args.seed)
     results = []
     for case in (case_keep_sets, case_no_require, case_operand_twice, case_reshape_inside, case_broadcast,
-                 case_per_channel, case_wrap, case_table_slope, case_between):
+                 case_per_channel, case_wrap, case_table_slope, case_table_rank0, case_between):
         bd, kw = case(rng)
         results.append(check_graph(case.__name__.removeprefix("case_"), bd, **kw))
         print(("ok   " if results[-1][0] else "FAIL ") + results[-1][1], flush=True)

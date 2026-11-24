@@ -484,8 +484,7 @@ class Emulator:
                                                   (host_slope > RANGE["INT16"][1])).any()):
             bad = (tab_slope < RANGE["INT16"][0]) | (tab_slope > RANGE["INT16"][1])
             self._count_bad(o, bad[idx].to(torch.int64), 0, 0, "TABLE slope outside INT16")
-        out = table[idx]
-        out *= 128
+        out = table[idx] * 128  # a new tensor: with a rank-0 x, table[idx] is a view of the table constant
         out += tab_slope[idx] * frac
         return [out]
 
