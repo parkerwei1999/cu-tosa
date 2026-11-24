@@ -57,8 +57,8 @@ def main(args):
         name, path = spec.split("=", 1)
         g = TosaGraphIR(path)
         ref = Int64Emulator(g, device="cuda")
-        arms = {"fused": Emulator(g, device="cuda", verify_narrow=True),
-                "unfused": Emulator(g, device="cuda", verify_narrow=True, fuse=False)}
+        arms = {"fused": Emulator(g, device="cuda"),
+                "unfused": Emulator(g, device="cuda", fuse=False)}
         rng = np.random.default_rng(args.seed)
         ok, first, nviol = True, None, 0
         for trial in range(args.trials):

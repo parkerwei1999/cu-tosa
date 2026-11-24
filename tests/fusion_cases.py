@@ -172,7 +172,6 @@ def check_graph(label, bd, samples=(1, 2, 3), keeps=((),), min_fused=1):
         f"\n      {p}" for p in problems[:4])
 
 
-# -- fixed cases -------------------------------------------------------------------------------------------------------
 def case_keep_sets(rng):
     b = Builder()
     x = b.inp(draw(rng, (2, 3), "INT32", "small"), "INT32")
@@ -288,7 +287,6 @@ def broadcasts_to(small, big):
         return False
 
 
-# -- random graphs ---------------------------------------------------------------------------------------------------
 def random_graph(rng):
     b = Builder()
     base = [(2, 3, 4), (4, 6), (2, 2, 2, 3), (6, 4), (12,)][rng.integers(5)]

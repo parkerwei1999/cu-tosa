@@ -13,7 +13,7 @@ from cutosa.kernels.matmul import bmm_i16
 def begin(ref, cu, samples):
     """what run() sets before the operators: empty REQUIRE records, the sample count, an operator that reads data."""
     ref.violations, ref._pending, ref.samples, ref._from_inputs = [], [], samples, True
-    cu._begin(samples)
+    cu._reset_require_counts(samples)
     cu._from_inputs = True
 
 
@@ -51,7 +51,7 @@ def rescale_rows(name, path, per_sig, gen):
                     rows.append((name, o.idx, sig, label, "not covered by the kernel", True))
                     continue
                 wc = [(m, c.tolist()) for _, _, m, c in ref._pending]
-                gc = [(m, c) for _, _, m, c in cu._slot_records()]
+                gc = [(m, c) for _, _, m, c in cu._require_count_records()]
                 ok = bool(torch.equal(got[0].to(torch.int64), want)) and wc == gc and got[0].dtype == STORE[sig[1]]
                 nbad = sum(sum(c) if isinstance(c, list) else c for _, c in wc)
                 rows.append((name, o.idx, sig, f"{label}, {x.numel()} el, {nbad} REQUIRE failures", ok))
@@ -110,7 +110,7 @@ def replay_rows(name, path, per_sig, gen):
                     rows.append((name, o.idx, sig, f"{draw}: not covered by the kernel", True))
                     continue
                 wc = [(m, c.tolist()) for _, _, m, c in ref._pending]
-                gc = [(m, c) for _, _, m, c in cu._slot_records()]
+                gc = [(m, c) for _, _, m, c in cu._require_count_records()]
                 wc = [(m, c) for m, c in wc if (any(c) if isinstance(c, list) else c)]  # run() drops zero counts
                 gc = [(m, c) for m, c in gc if (any(c) if isinstance(c, list) else c)]
                 ok = bool(torch.equal(got[0].to(torch.int64), want)) and wc == gc \
@@ -160,7 +160,7 @@ def unit_rows(name, path, per_struct, gen):
                     rows.append((name, u.root.idx, label, f"{draw}: not run as a unit", True))
                     continue
                 wc = [(i, m_, c.tolist()) for i, _, m_, c in ref._pending]
-                gc = [(i, m_, c) for i, _, m_, c in cu._slot_records()]
+                gc = [(i, m_, c) for i, _, m_, c in cu._require_count_records()]
                 nz = lambda rs: sorted((i, m_, c) for i, m_, c in rs if (any(c) if isinstance(c, list) else c))
                 ok = bool(torch.equal(got.to(torch.int64), want)) and nz(wc) == nz(gc) \
                     and got.dtype == STORE[g.dtype(u.root.outputs[0])]

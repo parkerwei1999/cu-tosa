@@ -31,7 +31,6 @@ def graph_status(violations: list, sample: int | None = None) -> str:
                                 for v in violations) else VALID
 
 
-# -- flatbuffer -> plain python IR -------------------------------------------------------------------------------------
 @dataclass
 class TensorInfo:
     name: str
@@ -132,7 +131,6 @@ class TosaGraphIR:
         return self.tensors[name].dtype if name in self.tensors else "SHAPE"
 
 
-# -- exact integer matmul through int8 limbs + torch._int_mm -----------------------------------------------------------
 def _limbs(x, nbits):
     """x (nbits signed values) -> (int8 limbs, low first, c) with x == sum 256^i limb_i + c."""
     nl = (nbits + 7) // 8
@@ -235,7 +233,6 @@ def _wrap(x, bits):
     return ((x + half) & ((1 << bits) - 1)) - half
 
 
-# -- emulator ----------------------------------------------------------------------------------------------------------
 class Emulator:
     def __init__(self, graph, device="cpu", check=True, mm_backend="intmm"):
         self.g = graph if isinstance(graph, TosaGraphIR) else TosaGraphIR(graph)
@@ -253,7 +250,6 @@ class Emulator:
             for n in o.inputs:
                 self.last_use[n] = o.idx
 
-    # -- helpers ---------------------------------------------------------------------------------------------------
     def _per_sample(self, o, bad):
         """bad -> int64 counts per sample: an op on graph-input data splits its outermost non-1 dimension into
         self.samples equal parts, which assumes the batch is that dimension's outermost factor (unchecked); an op on
@@ -321,7 +317,6 @@ class Emulator:
             raise NotImplementedError(f"{name}: non-constant operand where a constant is required")
         return v
 
-    # -- driver ----------------------------------------------------------------------------------------------------
     def run(self, inputs, hook=None, keep=(), samples=1):
         """inputs: integer arrays in graph input order. hook(op, outs): after every non-constant op. keep: tensor names
         to leave in self.env. samples > 1: REQUIRE counts per sample of a graph lowered at that batch."""
@@ -374,7 +369,6 @@ class Emulator:
         # Native quantize/dequantize glue expects the reference runner's C-order output.
         return t.cpu().numpy().astype(NP_DTYPE[self.g.dtype(name)], order="C")
 
-    # -- elementwise -----------------------------------------------------------------------------------------------
     def _checked_wrap(self, o, r, what):
         """REQUIRE r within the output type, then wrap to its low bits (the reference model's result)."""
         dt = self.g.dtype(o.outputs[0])
@@ -488,7 +482,6 @@ class Emulator:
         lo, hi = RANGE[out_dt]
         return [r.clamp_(lo, hi)]
 
-    # -- reductions ------------------------------------------------------------------------------------------------
     def op_REDUCE_SUM(self, o, x):
         """REQUIRE on every running sum along the axis (TOSA apply_add_s), not only the total; the total wraps."""
         axis, dt = o.attrs["Axis"], self.g.dtype(o.outputs[0])
@@ -502,7 +495,6 @@ class Emulator:
     def op_REDUCE_MAX(self, o, x):
         return [x.amax(dim=o.attrs["Axis"], keepdim=True)]
 
-    # -- tensor ops ------------------------------------------------------------------------------------------------
     def _acc_out(self, o, acc):
         dt = self.g.dtype(o.outputs[0])
         if dt == "INT32":  # reference model: Eigen int32 accumulation -> wraps on overflow
