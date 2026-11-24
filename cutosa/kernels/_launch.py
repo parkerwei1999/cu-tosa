@@ -1,6 +1,6 @@
-"""Kernel launch without Triton's per-call specialization on argument values (~15 us, as much as a small kernel).
-Compiled kernels are keyed by (device, tensor dtypes, constexprs); the direct call mirrors JITFunction.run of the
-Triton versions in DIRECT_VERSIONS; another version, a launch hook or CUTOSA_DIRECT_LAUNCH=0 uses fn[grid]."""
+"""Launches Triton kernels without Triton's per-call argument inspection (~15 us a launch, as long as a small
+kernel). Only for the Triton versions in DIRECT_VERSIONS; any other version, a profiler hook, or
+CUTOSA_DIRECT_LAUNCH=0 uses Triton's normal launch."""
 import inspect
 import os
 
@@ -37,7 +37,7 @@ class Kernel:
         device = driver.active.get_current_device()
         key = (device, types, consts)
         k = self._compiled.get(key)
-        if k is None or _ENTER.calls or _EXIT.calls:  # a profiler's launch hooks: Triton's own path calls them
+        if k is None or _ENTER.calls or _EXIT.calls:  # profiler hooks only run on Triton's normal launch path
             c = self.fn[grid](*args, *consts, **options)
             if DIRECT:
                 self._compiled[key] = (c.run, c.function, c.packed_metadata)

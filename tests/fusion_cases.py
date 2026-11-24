@@ -250,7 +250,8 @@ def case_wrap(rng):
 def case_table_slope(rng):
     b = Builder()
     v = draw(rng, (2, 8), "INT32")
-    v[:, 2:6] = (np.array([[100, 101, 102, 103], [101, 99, 102, 101]]) - 256) * 128 * 65536 + 5 * 65536  # those cells
+    # these inputs land in table cells 99-103, whose slopes are outside INT16
+    v[:, 2:6] = (np.array([[100, 101, 102, 103], [101, 99, 102, 101]]) - 256) * 128 * 65536 + 5 * 65536
     x = b.inp(v, "INT32")
     r = b.rescale(x, "INT16", 1 << 30, 46)
     tab = np.cumsum(rng.integers(-300, 300, 513))

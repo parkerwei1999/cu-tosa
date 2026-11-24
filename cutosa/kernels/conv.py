@@ -1,4 +1,4 @@
-"""CONV2D 1x1, stride 1, no padding (a Linear) on int8 tensor cores; INT16 input split into limbs as in matmul.py.
+"""CONV2D 1x1, stride 1, no padding (a Linear) on int8 tensor cores; an INT16 input is split into two int8 limbs.
 sum (x - izp)(w - wzp) = sum x w - wzp sum x - izp sum w + K izp wzp. INT32 output wraps, INT48 saturates."""
 import torch
 import triton
@@ -6,7 +6,7 @@ import triton.language as tl
 
 from ._launch import jit
 
-MAX_K = 65280  # the int32 row sums of an INT16 input (proofs/limb_proof.py)
+MAX_K = 65280  # the largest K whose int32 row sums of an INT16 input cannot overflow
 
 
 @jit

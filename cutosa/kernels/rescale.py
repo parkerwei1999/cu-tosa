@@ -1,5 +1,5 @@
-"""RESCALE kernel: single rounding, signed, one multiplier or one per channel (last dimension), scale 32 / 16.
-The int64 register cannot overflow: |x| <= 2^32 with mult < 2^31, or |x| < 2^48 with mult < 2^15, + <= 2^61."""
+"""RESCALE kernel: single rounding, signed, one multiplier or one per channel (last dimension).
+No int64 overflow: |x| <= 2^32 with mult < 2^31 (scale32), or |x| < 2^48 with mult < 2^15, plus rounding < 2^62."""
 import torch
 import triton
 import triton.language as tl
@@ -53,7 +53,7 @@ def rescale(x, out_dtype, mult, shift, izp, ozp, olo, ohi, scale32, per_channel,
     if per_channel:
         m_t, s_t, m, s, C = mult, shift, 0, 0, x.shape[-1]
     else:
-        m_t = s_t = cbuf  # not read
+        m_t = s_t = cbuf  # placeholder, not read without per_channel
         m, s, C = mult, shift, 1
     _rescale.launch((triton.cdiv(n_per, BLOCK), parts), (x, y, cbuf, m_t, s_t, n_per, c0, c1, C, izp, m, s, ozp, olo, ohi),
                     (scale32, per_channel, BLOCK))

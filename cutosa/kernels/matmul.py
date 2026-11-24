@@ -6,7 +6,7 @@ import triton.language as tl
 
 from ._launch import jit
 
-MAX_K = 65280  # proofs/limb_proof.py: (2^31 - 1) // 32896
+MAX_K = 65280  # (2^31 - 1) // 32896: the largest K whose int32 row sums cannot overflow (proofs/limb_proof.py)
 BM, BN, BK = 64, 64, 32
 
 

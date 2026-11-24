@@ -1,4 +1,4 @@
-"""cu-tosa: bit-exact GPU emulator of TOSA 1.0 integer graphs (README.md)."""
+"""Bit-exact GPU emulator of TOSA 1.0 integer graphs."""
 from .emulator import STORE, Emulator
 from .int64_ref import RANGE, UNPREDICTABLE, VALID, TosaGraphIR, graph_status
 from .int64_ref import Emulator as Int64Emulator

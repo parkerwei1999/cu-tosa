@@ -1,5 +1,5 @@
-"""One generated Triton kernel per fusion-unit structure: members in int64 registers, every REQUIRE counted,
-only the root stored. The structure `prog` is described at source()."""
+"""One generated Triton kernel per fusion-unit structure: the members are computed in int64 registers, every
+REQUIRE is counted, and only the root's result is stored."""
 import hashlib
 import linecache
 
@@ -25,10 +25,12 @@ def n_params(prog):
 
 
 def source(prog, name):
-    """prog = (leaf modes, ops). Leaf mode "f": x[g]; "i": x[(g // inner) % n]. Op = (kind, flags, refs), ref "L<k>"
-    or "V<j>"; flags: RESCALE (scale32, per_channel), ADD/SUB/MUL (output bits,), TABLE (wide, slope_check), else ().
-    Params, int64, in read order: per "i" leaf inner, n; RESCALE izp, mult, shift, ozp, lo, hi (per channel izp,
-    ozp, lo, hi, C); ADD/SUB lo, hi; MUL shift, lo, hi. Tensor args after the leaves: tables, then per-channel pairs."""
+    """Triton source of the kernel for prog = (leaf modes, ops); g = the output element index.
+    Leaf mode "f" reads x[g], "i" reads x[(g // inner) % n]. Op = (kind, flags, refs); ref "L<k>" = leaf k,
+    "V<j>" = result of op j. flags: RESCALE (scale32, per_channel), ADD / SUB / MUL (output bits,),
+    TABLE (wide, slope_check), others (). int64 params in order (lo, hi = the REQUIRE range): per "i" leaf inner,
+    n; RESCALE izp, mult, shift, ozp, lo, hi (per channel: izp, ozp, lo, hi, C); ADD / SUB lo, hi; MUL shift, lo,
+    hi. Tensor arguments after the leaves: the tables, then per-channel (mult, shift) pairs."""
     modes, ops = prog
     aux = [f"t{j}_ptr" for j, (k, f, _) in enumerate(ops) if k == "TABLE"] \
         + [a for j, (k, f, _) in enumerate(ops) if k == "RESCALE" and f[1] for a in (f"m{j}_ptr", f"s{j}_ptr")]
@@ -89,7 +91,8 @@ def source(prog, name):
                 L.append(f"    {v} = {a} {'+' if kind == 'ADD' else '-'} {b}")
             lo, hi = par(), par()
             count(f"({v} < {lo}) | ({v} > {hi})")
-            L.append(f"    {v} = {v}.to({_INT[flags[0]]}).to(tl.int64)")  # wraps as the stored result does
+            # keep only the low bits, as storing the result would
+            L.append(f"    {v} = {v}.to({_INT[flags[0]]}).to(tl.int64)")
         elif kind == "TABLE":
             x = refs[0]
             if flags[0]:
@@ -121,7 +124,8 @@ def kernel(prog):
         name = "fused_" + hashlib.sha256(repr(prog).encode()).hexdigest()[:16]
         src = source(prog, name)
         filename = f"<cutosa {name}>"
-        linecache.cache[filename] = (len(src), None, src.splitlines(True), filename)  # for inspect.getsource
+        # Triton reads a kernel's source through inspect.getsource
+        linecache.cache[filename] = (len(src), None, src.splitlines(True), filename)
         ns = {"jit": jit, "tl": tl}
         exec(compile(src, filename, "exec"), ns)
         fn = _kernels[prog] = ns[name]

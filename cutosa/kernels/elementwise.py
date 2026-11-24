@@ -1,5 +1,5 @@
-"""ADD / SUB / MUL, TABLE and REDUCE_SUM kernels: int64 registers, REQUIREs counted, low bits stored (the wrap).
-A broadcast operand is read in place as x[(g // inner) % n] when index_plan allows it, else expanded first."""
+"""ADD / SUB / MUL, TABLE and REDUCE_SUM kernels. A result outside its type keeps its low bits, as in the
+reference model. A broadcast operand is read in place as x[(g // inner) % n] when possible, else expanded."""
 import math
 
 import torch
@@ -58,7 +58,8 @@ def broadcast_shape(a, b):
 
 
 def index_plan(xshape, shape):
-    """-> ("flat" | "index" | "expand", inner, n) for reading an operand of xshape over the flat index of shape."""
+    """how to read an operand of xshape at output index g of `shape`: ("flat", 1, total) reads x[g],
+    ("index", inner, n) reads x[(g // inner) % n], ("expand", 1, total) needs an expanded copy."""
     total = math.prod(shape)
     xs = (1,) * (len(shape) - len(xshape)) + tuple(xshape)
     if xs == tuple(shape):
@@ -73,7 +74,7 @@ def index_plan(xshape, shape):
 
 
 def _operand(x, shape):
-    """x -> (contiguous tensor, inner, n, flat) for the index (flat // inner) % n over the output's flat index."""
+    """-> (contiguous tensor, inner, n, flat) to read x at output index g as x[(g // inner) % n]."""
     mode, inner, n = index_plan(x.shape, shape)
     if mode == "expand":
         return x.expand(shape).contiguous(), 1, n, True
@@ -142,7 +143,7 @@ def _reduce_sum(x_ptr, y_ptr, c_ptr, n_per: tl.int64, c0: tl.int64, L: tl.int64,
 @jit
 def _reduce_sum_last(x_ptr, y_ptr, c_ptr, n_per: tl.int64, c0: tl.int64, L: tl.int64, lo: tl.int64, hi: tl.int64,
                      BJ: tl.constexpr, BK: tl.constexpr):
-    """the same over the last axis in BJ x BK tiles: running sums = carried sum + cumsum (a padded 0 repeats one)."""
+    """the same over the last axis, in BJ x BK tiles: running sums = the carried sum + a cumsum inside the tile."""
     pid = tl.program_id(0)
     sid = tl.program_id(1)
     rj = pid.to(tl.int64) * BJ + tl.arange(0, BJ)
@@ -172,7 +173,7 @@ def reduce_sum(x, axis, out_dtype, lo, hi, cbuf, c0, parts=1):
     n_per = math.prod(shape) // parts
     y = torch.empty(shape, dtype=out_dtype, device=x.device)
     if inner == 1:
-        # a tile spans the axis (<= 1024) and a program ~2048 elements: 228 sums of 1024 took 186 us, now 8 us
+        # one tile spans the whole axis (<= 1024), one program ~2048 elements: smaller tiles were 20x slower
         BK = min(max(32, triton.next_power_of_2(L)), 1024)
         BJ = max(2, 2048 // BK)
         _reduce_sum_last.launch((triton.cdiv(n_per, BJ), parts), (x, y, cbuf, n_per, c0, L, lo, hi), (BJ, BK))

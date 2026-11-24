@@ -1,5 +1,5 @@
-"""Fusion plan: which pointwise operators run together as one generated kernel (a unit); rules in README.md.
-Depends on the graph only (shapes, types, attributes, constants), never on data."""
+"""Which pointwise operators run together as one generated kernel (a fusion unit). The plan depends only on
+the graph, never on input data."""
 import math
 
 import numpy as np
@@ -18,7 +18,7 @@ def _const(g, name):
 
 
 def eligible(g, o):
-    """whether the fused kernel computes `o` exactly: the conditions of the k_<OP> methods in emulator.py."""
+    """whether the fused kernel computes `o` exactly."""
     if o.op not in POINTWISE:
         return False
     out_dt = g.dtype(o.outputs[0])
@@ -51,12 +51,14 @@ def eligible(g, o):
         sig = (g.dtype(o.inputs[0]), g.dtype(o.inputs[1]), out_dt, None if tab is None else tab.size)
         if sig == ("INT8", "INT8", "INT8", 256):
             return True
-        return sig == ("INT16", "INT16", "INT32", 513)  # a slope outside INT16 is counted by the unit's kernel
-    return True  # MINIMUM, MAXIMUM, GREATER, GREATER_EQUAL, SELECT
+        return sig == ("INT16", "INT16", "INT32", 513)  # the fused kernel counts a slope outside INT16 itself
+    return True
 
 
 class Unit:
-    """members in graph order, root last; reshapes between members; leaves [(member idx, tensor)]; key: member idxs."""
+    """Operators computed by one generated kernel. members: in graph order; the last (the root) is the only one
+    whose result is stored. reshapes: RESHAPEs between members. leaves: (member index, tensor) pairs the kernel
+    reads from memory. key: the member indices."""
 
     def __init__(self, root):
         self.root, self.members, self.reshapes, self.leaves, self.key = root, [root], [], [], None
