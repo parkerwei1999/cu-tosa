@@ -256,7 +256,8 @@ class Emulator:
     # -- helpers ---------------------------------------------------------------------------------------------------
     def _per_sample(self, o, bad):
         """bad -> int64 counts per sample: an op on graph-input data splits its outermost non-1 dimension into
-        self.samples equal parts (sample-major); an op on constants only, or a scalar check, counts for every sample."""
+        self.samples equal parts, which assumes the batch is that dimension's outermost factor (unchecked); an op on
+        constants only, or a scalar check, counts for every sample."""
         if bad.dim() == 0 or not self._from_inputs:
             return bad.sum().to(torch.int64).expand(self.samples)
         if next((d for d in bad.shape if d != 1), 1) % self.samples:
