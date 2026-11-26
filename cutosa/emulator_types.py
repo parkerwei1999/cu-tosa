@@ -48,13 +48,4 @@ class CompiledUnit:
     checked_shapes: list[tuple[OpInfo, tuple[int, ...]]]
     counters_per_sample: list[RequireCounter]
     counters_whole: list[RequireCounter]
-    parts_by_samples: dict[int, int]
-
-    def has_cached_parts(self, samples: int) -> bool:
-        return samples in self.parts_by_samples
-
-    def read_cached_parts(self, samples: int) -> int:
-        return self.parts_by_samples[samples]
-
-    def write_cached_parts(self, samples: int, parts: int) -> None:
-        self.parts_by_samples[samples] = parts
+    cached_parts_by_samples: dict[int, int]

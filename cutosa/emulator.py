@@ -6,7 +6,7 @@ import numpy as np
 import torch
 
 from .emulator_types import CompiledUnit, How, PlanStep, RequireCounter
-from .fusion import Unit, eligible, mul_kernel_shift, plan, table_slope_can_fail
+from .fusion import Unit, eligible, mul_kernel_shift, ops_with_input_dependency, plan, table_slope_can_fail
 from .int64_ref import BITS, DATA_OPERANDS, RANGE, OpInfo, Require, TosaGraphIR, Violation
 from .int64_ref import Emulator as Int64Emulator
 
@@ -223,13 +223,10 @@ class Emulator(Int64Emulator):
             for n, i in last.items():
                 if n not in keep and n not in self.consts:
                     free.setdefault(i, []).append(n)
-            from_inputs, steps = set(g.inputs), []
-            for o in g.ops:
+            steps = []
+            for o, reads in ops_with_input_dependency(g):
                 if o.op in ("CONST", "CONST_SHAPE"):
                     continue
-                reads = any(n in from_inputs for n in o.inputs)
-                if reads:
-                    from_inputs.update(o.outputs)
                 if o.idx not in absorbed:
                     steps.append(PlanStep(o, units.get(o.idx), reads, tuple(free.get(o.idx, ()))))
             self._plans[key] = (absorbed, steps)
@@ -314,7 +311,7 @@ class Emulator(Int64Emulator):
         params = torch.tensor(index_params + member_params + [0], dtype=torch.int64, device=self.device)
         kernel, n_params, n_counters = fused.kernel(prog)
         assert params.numel() - 1 == n_params and len(checks) == n_counters
-        root = u.members[-1].outputs[0]
+        root = u.root.outputs[0]
         store = STORE[g.dtype(root)]
         # the kernel is compiled for these dtypes without looking at the tensors; _run_on_cuda keeps every graph tensor
         # that is not a constant at STORE[type]
@@ -326,7 +323,7 @@ class Emulator(Int64Emulator):
                             checked_shapes=list({m.idx: (m, g.tensors[m.outputs[0]].shape)
                                                  for m, _ in checks}.values()),
                             counters_per_sample=[c._replace(per_sample=True) for _, c in checks],
-                            counters_whole=[c for _, c in checks], parts_by_samples={})
+                            counters_whole=[c for _, c in checks], cached_parts_by_samples={})
 
     def _unit_sample_parts(self, compiled: CompiledUnit) -> int:
         """the unit's per-sample split; raises where the int64 emulator raises."""
@@ -344,9 +341,9 @@ class Emulator(Int64Emulator):
         compiled = self._compiled_units.get(u.key)
         if compiled is None:
             compiled = self._compiled_units[u.key] = self._compile_unit(u)
-        if not compiled.has_cached_parts(self.samples):  # it depends on shapes only
-            compiled.write_cached_parts(self.samples, self._unit_sample_parts(compiled))
-        parts = compiled.read_cached_parts(self.samples)
+        parts = compiled.cached_parts_by_samples.get(self.samples)
+        if parts is None:
+            parts = compiled.cached_parts_by_samples[self.samples] = self._unit_sample_parts(compiled)
         cbase, cstride = len(self._counters) * self.samples, self.samples
         self._counters += compiled.counters_per_sample if parts == self.samples else compiled.counters_whole
         leaves = [env[n].contiguous() if shape is None else env[n].expand(shape).contiguous()

@@ -1,10 +1,11 @@
 """Which pointwise operators run together as one generated kernel (a fusion unit). The plan depends only on
 the graph, never on input data."""
 import math
+from collections.abc import Iterator
 
 import numpy as np
 
-from .int64_ref import DATA_OPERANDS, RANGE, ROUND_SINGLE
+from .int64_ref import DATA_OPERANDS, RANGE, ROUND_SINGLE, OpInfo, TosaGraphIR
 
 POINTWISE = ("RESCALE", "ADD", "SUB", "MUL", "TABLE", "MINIMUM", "MAXIMUM", "GREATER", "GREATER_EQUAL", "SELECT")
 MAX_OPS = 24  # bounds the generated kernel's size
@@ -69,12 +70,27 @@ class Unit:
     whose result is stored. reshapes: RESHAPEs between members. leaves: (member index, tensor) pairs the kernel
     reads from memory."""
 
-    def __init__(self, root):
-        self.root, self.members, self.reshapes, self.leaves = root, [root], [], []
+    def __init__(self, root: OpInfo) -> None:
+        self.members = [root]
+        self.reshapes: list[OpInfo] = []
+        self.leaves: list[tuple[int, str]] = []
+
+    @property
+    def root(self) -> OpInfo:
+        return self.members[-1]
 
     @property
     def key(self) -> tuple[int, ...]:
         return tuple(m.idx for m in self.members)
+
+
+def ops_with_input_dependency(g: TosaGraphIR) -> Iterator[tuple[OpInfo, bool]]:
+    from_inputs = set(g.inputs)
+    for op in g.ops:
+        reads_inputs = any(name in from_inputs for name in op.inputs)
+        if reads_inputs:
+            from_inputs.update(op.outputs)
+        yield op, reads_inputs
 
 
 def plan(g, keep=()):
@@ -86,12 +102,7 @@ def plan(g, keep=()):
             producer[n] = o
         for n in o.inputs:
             consumers.setdefault(n, []).append(o)
-    from_inputs = set(g.inputs)
-    reads_data = {}
-    for o in g.ops:
-        reads_data[o.idx] = any(n in from_inputs for n in o.inputs)
-        if reads_data[o.idx]:
-            from_inputs.update(o.outputs)
+    reads_data = {o.idx: reads for o, reads in ops_with_input_dependency(g)}
     pinned = set(keep) | set(g.outputs)
     ok = {o.idx: eligible(g, o) and reads_data[o.idx] for o in g.ops}
 
@@ -125,6 +136,7 @@ def plan(g, keep=()):
                 u.reshapes += chain
                 todo.append(p)
         u.members.sort(key=lambda m: m.idx)
+        assert u.root is o
         inside = {m.outputs[0] for m in u.members} | {r.outputs[0] for r in u.reshapes}
         for m in u.members:
             for n in m.inputs[:DATA_OPERANDS[m.op]]:
