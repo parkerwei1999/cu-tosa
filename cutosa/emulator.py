@@ -122,7 +122,7 @@ class Emulator(Int64Emulator):
         # no INT48 overflow count needed: |sum| <= K * 2^30 < 2^47 for K <= MAX_K
         return [bmm_i16(A, B)]
 
-    def _k_binary(self, o: OpInfo, code: int, a: torch.Tensor, b: torch.Tensor, req: Require, kernel_shift: int,
+    def _k_binary(self, o: OpInfo, a: torch.Tensor, b: torch.Tensor, req: Require, kernel_shift: int,
                   **fmt: object) -> list[torch.Tensor] | None:
         from .kernels.elementwise import binary, broadcast_shape
         if not eligible(self.g, o):
@@ -130,21 +130,18 @@ class Emulator(Int64Emulator):
         out_dt = self.g.dtype(o.outputs[0])
         parts = self._sample_parts(o, broadcast_shape(a.shape, b.shape))
         c0 = self._new_require_counter(o, req, parts, dt=out_dt, **fmt)
-        return [binary(code, a, b, STORE[out_dt], *RANGE[out_dt], self._cbuf, c0, kernel_shift, parts)]
+        return [binary(o.op, a, b, STORE[out_dt], *RANGE[out_dt], self._cbuf, c0, kernel_shift, parts)]
 
     def k_ADD(self, o: OpInfo, a: torch.Tensor, b: torch.Tensor) -> list[torch.Tensor] | None:
-        from .kernels.elementwise import ADD
-        return self._k_binary(o, ADD, a, b, Require.ADD_RESULT, 0)
+        return self._k_binary(o, a, b, Require.ADD_RESULT, 0)
 
     def k_SUB(self, o: OpInfo, a: torch.Tensor, b: torch.Tensor) -> list[torch.Tensor] | None:
-        from .kernels.elementwise import SUB
-        return self._k_binary(o, SUB, a, b, Require.SUB_RESULT, 0)
+        return self._k_binary(o, a, b, Require.SUB_RESULT, 0)
 
     def k_MUL(self, o: OpInfo, a: torch.Tensor, b: torch.Tensor) -> list[torch.Tensor] | None:
-        from .kernels.elementwise import MUL
         shift = self._scalar(o.inputs[2])
         req = Require.MUL_RESULT if shift else Require.MUL_RESULT_SHIFT0
-        return self._k_binary(o, MUL, a, b, req, mul_kernel_shift(self.g.dtype(o.inputs[0]), shift), shift=shift)
+        return self._k_binary(o, a, b, req, mul_kernel_shift(self.g.dtype(o.inputs[0]), shift), shift=shift)
 
     def k_TABLE(self, o: OpInfo, x: torch.Tensor) -> list[torch.Tensor] | None:
         from .kernels.elementwise import table_int8, table_int16

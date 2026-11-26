@@ -49,3 +49,12 @@ class Kernel:
 
 def jit(fn):
     return Kernel(fn)
+
+
+@triton.jit
+def add_count(c_ptr, slot, bad, mask):
+    """adds the number of lanes where both `bad` and `mask` hold to c_ptr[slot]. A kernel run over `parts` equal parts
+    of its output counts part p into slot c0 + p."""
+    n = tl.sum(tl.where(mask, bad, 0).to(tl.int64))
+    if n > 0:
+        tl.atomic_add(c_ptr + slot, n)

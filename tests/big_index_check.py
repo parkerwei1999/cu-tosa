@@ -5,7 +5,7 @@ import sys
 import torch
 
 from cutosa.kernels import fused
-from cutosa.kernels.elementwise import ADD, binary, reduce_sum
+from cutosa.kernels.elementwise import binary, reduce_sum
 from cutosa.kernels.rescale import rescale
 
 N, C = 2**21 + 1, 1024
@@ -13,7 +13,7 @@ gen = torch.Generator().manual_seed(0)
 a = torch.randint(-128, 128, (N, 1), generator=gen, dtype=torch.int8).cuda()
 b = torch.randint(-128, 128, (1, C), generator=gen, dtype=torch.int8).cuda()
 cbuf = torch.zeros(4, dtype=torch.int64, device="cuda")
-y = binary(ADD, a, b, torch.int8, -128, 127, cbuf, 0, 0, 1)
+y = binary("ADD", a, b, torch.int8, -128, 127, cbuf, 0, 0, 1)
 ok, bad = True, 0
 for i in range(0, N, 2**16):
     want = a[i:i + 2**16].to(torch.int16) + b.to(torch.int16)

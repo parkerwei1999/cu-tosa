@@ -1,20 +1,20 @@
 """ADD / SUB / MUL, TABLE and REDUCE_SUM kernels. A result outside its type keeps its low bits, as in the
 reference model. A broadcast operand is read in place as x[(g // inner) % n] when possible, else expanded."""
 import math
+from collections.abc import Sequence
 
 import torch
 import triton
 import triton.language as tl
 
-from ._launch import jit
+from ._launch import add_count, jit
 
 BLOCK = 1024
-ADD, SUB, MUL = 0, 1, 2
 
 
 @jit
-def _binary(a_ptr, b_ptr, y_ptr, c_ptr, n_per: tl.int64, c0: tl.int64, ia: tl.int64, na: tl.int64, ib: tl.int64,  # pyright: ignore[reportInvalidTypeForm]
-            nb_b: tl.int64, shift: tl.int64, lo: tl.int64, hi: tl.int64,  # pyright: ignore[reportInvalidTypeForm]
+def _binary(a_ptr, b_ptr, y_ptr, c_ptr, n_per: tl.int64, c0: tl.int64, a_inner: tl.int64, a_count: tl.int64,  # pyright: ignore[reportInvalidTypeForm]
+            b_inner: tl.int64, b_count: tl.int64, shift: tl.int64, lo: tl.int64, hi: tl.int64,  # pyright: ignore[reportInvalidTypeForm]
             OP: tl.constexpr, A_FLAT: tl.constexpr, B_FLAT: tl.constexpr, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
     sid = tl.program_id(1)
@@ -24,28 +24,26 @@ def _binary(a_ptr, b_ptr, y_ptr, c_ptr, n_per: tl.int64, c0: tl.int64, ia: tl.in
     if A_FLAT:
         ga = g
     else:
-        ga = (g // ia) % na
+        ga = (g // a_inner) % a_count
     if B_FLAT:
         gb = g
     else:
-        gb = (g // ib) % nb_b
+        gb = (g // b_inner) % b_count
     a = tl.load(a_ptr + ga, mask=mask, other=0).to(tl.int64)
     b = tl.load(b_ptr + gb, mask=mask, other=0).to(tl.int64)
-    if OP == 0:
+    if OP == "ADD":
         r = a + b
-    elif OP == 1:
+    elif OP == "SUB":
         r = a - b
     else:
+        tl.static_assert(OP == "MUL")
         one = tl.full((BLOCK,), 1, tl.int64)
         r = (a * b + ((one << shift) >> 1)) >> shift
-    bad = (r < lo) | (r > hi)
     tl.store(y_ptr + g, r.to(y_ptr.dtype.element_ty), mask=mask)
-    n0 = tl.sum((bad & mask).to(tl.int64), axis=0)
-    if n0 > 0:
-        tl.atomic_add(c_ptr + c0 + sid, n0)
+    add_count(c_ptr, c0 + sid, (r < lo) | (r > hi), mask)
 
 
-def broadcast_shape(a, b):
+def broadcast_shape(a: Sequence[int], b: Sequence[int]) -> tuple[int, ...]:
     """the broadcast of two shapes (torch.broadcast_shapes costs ~30 us a call, more than the kernel launch)."""
     a, b = tuple(a), tuple(b)
     if a == b:
@@ -57,7 +55,7 @@ def broadcast_shape(a, b):
     return tuple(y if x == 1 else x for x, y in zip(a, b))
 
 
-def index_plan(xshape, shape):
+def index_plan(xshape: Sequence[int], shape: Sequence[int]) -> tuple[str, int, int]:
     """how to read an operand of xshape at output index g of `shape`: ("flat", 1, total) reads x[g],
     ("index", inner, n) reads x[(g // inner) % n], ("expand", 1, total) needs an expanded copy."""
     total = math.prod(shape)
@@ -73,7 +71,7 @@ def index_plan(xshape, shape):
     return "expand", 1, total
 
 
-def _operand(x, shape):
+def _operand(x: torch.Tensor, shape: tuple[int, ...]) -> tuple[torch.Tensor, int, int, bool]:
     """-> (contiguous tensor, inner, n, flat) to read x at output index g as x[(g // inner) % n]."""
     mode, inner, n = index_plan(x.shape, shape)
     if mode == "expand":
@@ -81,15 +79,17 @@ def _operand(x, shape):
     return x.contiguous(), inner, n, mode == "flat"
 
 
-def binary(op, a, b, out_dtype, lo, hi, cbuf, c0, shift, parts):
-    """op: ADD / SUB / MUL; shift: MUL's rounding shift (0..62). -> y at out_dtype, the low bits of the exact result.
-    Part p of `parts` equal parts adds its count of results outside [lo, hi] to cbuf[c0 + p]."""
+def binary(op: str, a: torch.Tensor, b: torch.Tensor, out_dtype: torch.dtype, lo: int, hi: int, cbuf: torch.Tensor,
+           c0: int, shift: int, parts: int) -> torch.Tensor:
+    """op: "ADD" / "SUB" / "MUL"; shift: MUL's rounding shift (0..62). -> y at out_dtype, the low bits of the exact
+    result; counts the results outside [lo, hi]."""
     shape = broadcast_shape(a.shape, b.shape)
     n_per = math.prod(shape) // parts
-    a, ia, na, a_flat = _operand(a, shape)
-    b, ib, nb_b, b_flat = _operand(b, shape)
+    a, a_inner, a_count, a_flat = _operand(a, shape)
+    b, b_inner, b_count, b_flat = _operand(b, shape)
     y = torch.empty(shape, dtype=out_dtype, device=a.device)
-    _binary.launch((triton.cdiv(n_per, BLOCK), parts), (a, b, y, cbuf, n_per, c0, ia, na, ib, nb_b, shift, lo, hi),
+    _binary.launch((triton.cdiv(n_per, BLOCK), parts),
+                   (a, b, y, cbuf, n_per, c0, a_inner, a_count, b_inner, b_count, shift, lo, hi),
                    (op, a_flat, b_flat, BLOCK))
     return y
 
@@ -113,12 +113,10 @@ def _table_int16(x_ptr, t_ptr, y_ptr, c_ptr, n_per: tl.int64, c0: tl.int64, BLOC
     base = tl.load(t_ptr + idx, mask=mask, other=0).to(tl.int32)
     slope = tl.load(t_ptr + idx + 1, mask=mask, other=0).to(tl.int32) - base
     tl.store(y_ptr + g, base * 128 + slope * (x & 127), mask=mask)
-    n0 = tl.sum((((slope < -32768) | (slope > 32767)) & mask).to(tl.int64), axis=0)
-    if n0 > 0:
-        tl.atomic_add(c_ptr + c0 + sid, n0)
+    add_count(c_ptr, c0 + sid, (slope < -32768) | (slope > 32767), mask)
 
 
-def table_int8(x, tab):
+def table_int8(x: torch.Tensor, tab: torch.Tensor) -> torch.Tensor:
     """256 entries: y = tab[x + 128]."""
     x = x.contiguous()
     n = x.numel()
@@ -127,9 +125,9 @@ def table_int8(x, tab):
     return y
 
 
-def table_int16(x, tab, cbuf, c0, parts):
+def table_int16(x: torch.Tensor, tab: torch.Tensor, cbuf: torch.Tensor, c0: int, parts: int) -> torch.Tensor:
     """513 entries: y (INT32) = entry * 128 + slope * (x & 127), entry = tab[(x >> 7) + 256], slope = the next entry -
-    entry. Part p of `parts` equal parts adds its count of elements whose slope is outside INT16 to cbuf[c0 + p]."""
+    entry; counts the elements whose slope is outside INT16."""
     x = x.contiguous()
     n_per = x.numel() // parts
     y = torch.empty(x.shape, dtype=torch.int32, device=x.device)
@@ -154,9 +152,7 @@ def _reduce_sum(x_ptr, y_ptr, c_ptr, n_per: tl.int64, c0: tl.int64, L: tl.int64,
         acc += tl.load(x_ptr + base + k * inner, mask=mask, other=0).to(tl.int64)
         bad = bad | ((acc < lo) | (acc > hi)).to(tl.int64)
     tl.store(y_ptr + j, acc.to(y_ptr.dtype.element_ty), mask=mask)
-    n0 = tl.sum(bad * mask.to(tl.int64), axis=0)
-    if n0 > 0:
-        tl.atomic_add(c_ptr + c0 + sid, n0)
+    add_count(c_ptr, c0 + sid, bad, mask)
 
 
 @jit
@@ -178,13 +174,13 @@ def _reduce_sum_last(x_ptr, y_ptr, c_ptr, n_per: tl.int64, c0: tl.int64, L: tl.i
         bad = bad | tl.max(((run < lo) | (run > hi)).to(tl.int64), axis=1)
         acc += tl.sum(t, axis=1)
     tl.store(y_ptr + j, acc.to(y_ptr.dtype.element_ty), mask=mj)
-    n0 = tl.sum(bad * mj.to(tl.int64), axis=0)
-    if n0 > 0:
-        tl.atomic_add(c_ptr + c0 + sid, n0)
+    add_count(c_ptr, c0 + sid, bad, mj)
 
 
-def reduce_sum(x, axis, out_dtype, lo, hi, cbuf, c0, parts):
-    """Returns y = the sum over `axis` kept as a dimension of 1, at out_dtype; REQUIRE counts as in binary()."""
+def reduce_sum(x: torch.Tensor, axis: int, out_dtype: torch.dtype, lo: int, hi: int, cbuf: torch.Tensor, c0: int,
+               parts: int) -> torch.Tensor:
+    """-> the sum over `axis`, kept as a dimension of 1, at out_dtype; counts the outputs with a running sum outside
+    [lo, hi]."""
     x = x.contiguous()
     L = x.shape[axis]
     inner = math.prod(x.shape[axis + 1:])

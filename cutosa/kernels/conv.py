@@ -4,7 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ._launch import jit
+from ._launch import add_count, jit
 
 MAX_K = 65280  # the largest K whose int32 row sums of an INT16 input cannot overflow
 
@@ -53,14 +53,12 @@ def _linear(x_ptr, w_ptr, y_ptr, c_ptr, bias_ptr, wsum_ptr, M_per: tl.int64, N: 
     if SAT:
         acc = tl.minimum(tl.maximum(acc, lo), hi)
     tl.store(y_ptr + row[:, None] * N + rn[None, :], acc.to(y_ptr.dtype.element_ty), mask=m2)
-    n0 = tl.sum(tl.sum((bad & m2).to(tl.int64), axis=1), axis=0)
-    if n0 > 0:
-        tl.atomic_add(c_ptr + c0 + sid, n0)
+    add_count(c_ptr, c0 + sid, bad, m2)
 
 
 def linear(x, w, bias64, wsum64, out_dtype, izp, wzp, lo, hi, saturate, cbuf, c0, parts):
     """x [M, K] int8 or int16, w [N, K] int8, bias64 and wsum64 (sum_k w) int64 [N] -> y [M, N] at out_dtype.
-    Part p of `parts` equal row ranges adds its count of accumulators outside [lo, hi] to cbuf[c0 + p]."""
+    Counts the accumulators outside [lo, hi]; the parts are row ranges."""
     M, K = x.shape
     N = w.shape[0]
     if K > MAX_K or N * K >= 2**31 or triton.cdiv(N, 64) > 65535:

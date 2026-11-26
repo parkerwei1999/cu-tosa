@@ -4,7 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ._launch import jit
+from ._launch import add_count, jit
 
 BLOCK = 1024
 
@@ -37,17 +37,14 @@ def _rescale(x_ptr, y_ptr, c_ptr, m_ptr, s_ptr, n_per: tl.int64, c0: tl.int64, c
     bad1 = (r < -2147483648) | (r > 2147483647)
     r = tl.minimum(tl.maximum(r, olo), ohi)
     tl.store(y_ptr + g, r.to(y_ptr.dtype.element_ty), mask=mask)
-    n0 = tl.sum((bad0 & mask).to(tl.int64), axis=0)
-    n1 = tl.sum((bad1 & mask).to(tl.int64), axis=0)
-    if n0 > 0:
-        tl.atomic_add(c_ptr + c0 + sid, n0)
-    if n1 > 0:
-        tl.atomic_add(c_ptr + c1 + sid, n1)
+    add_count(c_ptr, c0 + sid, bad0, mask)
+    add_count(c_ptr, c1 + sid, bad1, mask)
 
 
 def rescale(x, out_dtype, mult, shift, izp, ozp, olo, ohi, scale32, per_channel, cbuf, c0, c1, parts):
-    """mult / shift: python ints, or int64 CUDA tensors of x.shape[-1] values (per_channel). Part p of `parts`
-    equal parts of x adds its REQUIRE counts to cbuf[c0 + p] and cbuf[c1 + p]."""
+    """mult / shift: python ints, or int64 CUDA tensors of x.shape[-1] values (per_channel). Counts at c0 the
+    apply_scale_32 inputs (scale32) or apply_scale_16 results outside their range, at c1 the results + ozp outside
+    INT32."""
     n_per = x.numel() // parts
     y = torch.empty(x.shape, dtype=out_dtype, device=x.device)
     if per_channel:
