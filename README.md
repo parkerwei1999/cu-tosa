@@ -51,7 +51,8 @@ These stop a run with an exception; none gives a wrong result.
 ```
 PYTHONPATH=. python tests/kernel_check.py name=graph.tosa ...     # each kernel against the int64 emulator's operator
 PYTHONPATH=. python tests/graph_equiv.py name=graph.tosa ...      # whole graphs, bit for bit, with timing
-tests/run_ut_vs_reference.sh <tosa_emu_op_check.py> graph.tosa ...  # operator instances against tosa_reference_model
+PYTHONPATH=. python tests/reference_op_check.py --graphs a.tosa ...  # operators against tosa_reference_model
+PYTHONPATH=. python tests/reference_overflow_check.py              # INT32 overflow cases against it
 PYTHONPATH=. python tests/fusion_cases.py                         # fusion on synthetic and random graphs
 PYTHONPATH=. python tests/fusion_stats.py name=graph.tosa ...     # what the fusion plan removes
 PYTHONPATH=. python tests/big_index_check.py                      # flat indices beyond 2^31 (5 GiB of GPU memory)
@@ -61,6 +62,30 @@ python tests/ref_sync.py <kit tosa_emu.py>                         # int64_ref.p
 ```
 
 Needs torch (with triton), numpy and `tosa-tools`; `z3-solver` only for `proofs/`.
+
+### Against the reference model
+
+The TOSA reference model (`tosa_reference_model`, CPU) is the ground truth. A row passes when every output is bitwise
+equal (dtype, shape, values) and the graph statuses agree (its `GraphStatus` vs `graph_status`).
+
+- `reference_op_check.py`, synthetic part: hand-built graphs for the edge cases the deployed graphs depend on.
+  GREATER_EQUAL / GREATER on ties and INT32 extremes, the GREATER_EQUAL -> SELECT pair of the GA-LN hard mix (SELECT
+  on INT8 / INT16 / INT32), the MAXIMUM -> MINIMUM INT32 clamp guards, CLAMP, every input code of an INT8 and an INT16
+  TABLE, RESCALE single and double rounding and per channel, MATMUL with K <= 1024 and K > 1024, CONV2D past a CUDA
+  row block and with pad / stride, GATHER, the reductions and the shape ops.
+- `reference_op_check.py`, instances: for every `--graphs` file, every GREATER / GREATER_EQUAL / SELECT and up to
+  `--per-signature` operators of every other signature (operator, input and output dtypes, which inputs are constant,
+  RESCALE attributes, CONV2D stride / dilation / padding), each cut out with its constants and attributes and run on
+  two random draws: `narrow` (INT32 codes within +-2^15, RESCALE inputs within apply_scale_32's range) and `full`
+  (every code of the dtype, so the overflow paths run too).
+- The reference model takes no INT48 or BOOL array from numpy. An INT48 input is made inside the graph by a CONV2D
+  (rank 4) or MATMUL (rank 3) from INT16 codes, a BOOL input by a GREATER_EQUAL of two INT32 inputs. An INT48 result
+  is read through a RESCALE to INT32: the identity in `narrow`, whose MATMUL / CONV2D inputs keep every sum within
+  INT32 (every bit compared), and shift 31 in `full` (the top bits).
+- When the reference model stops evaluating (a RESCALE input or result out of range: UNPREDICTABLE, outputs
+  uninitialised) only the statuses are compared.
+- `reference_overflow_check.py`: ADD, SUB and MUL past INT32, REDUCE_SUM with a running sum and with a total out of
+  range, and overflowing results that feed a RESCALE, a REDUCE_SUM and an ADD.
 
 ## Running the kit on cu-tosa without editing it
 
