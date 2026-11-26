@@ -113,14 +113,16 @@ class Emulator(Int64Emulator):
                         self._cbuf, c0, c1, parts)]
 
     def k_MATMUL(self, o: OpInfo, A: torch.Tensor, B: torch.Tensor) -> list[torch.Tensor] | None:
-        from .kernels.matmul import bmm_i16, fits
-        if self.g.dtype(o.inputs[0]) != "INT16" or self.g.dtype(o.inputs[1]) != "INT16" \
-                or self.g.dtype(o.outputs[0]) != "INT48" or self._scalar(o.inputs[2]) or self._scalar(o.inputs[3]) \
-                or A.numel() == 0 or B.numel() == 0 or not fits(*A.shape, B.shape[2]):  # pyright: ignore[reportCallIssue]
+        from .kernels.matmul import bmm, fits
+        types = (self.g.dtype(o.inputs[0]), self.g.dtype(o.inputs[1]), self.g.dtype(o.outputs[0]))
+        azp, bzp = self._scalar(o.inputs[2]), self._scalar(o.inputs[3])
+        wide = types == ("INT16", "INT16", "INT48")
+        if not (wide or types == ("INT8", "INT8", "INT32")) or (wide and (azp or bzp)) \
+                or A.numel() == 0 or B.numel() == 0 or not fits(*A.shape, B.shape[2], wide):  # pyright: ignore[reportCallIssue]
             return None
         self._check_sample_split(o, (A.shape[0], A.shape[1], B.shape[2]))
-        # no INT48 overflow count needed: |sum| <= K * 2^30 < 2^47 for K <= MAX_K
-        return [bmm_i16(A, B)]
+        # no overflow count needed: within fits() the sum stays inside INT48 (|sum| <= K 2^30) or INT32
+        return [bmm(A, B, azp, bzp)]
 
     def _k_binary(self, o: OpInfo, a: torch.Tensor, b: torch.Tensor, req: Require, kernel_shift: int,
                   **fmt: object) -> list[torch.Tensor] | None:
@@ -168,31 +170,33 @@ class Emulator(Int64Emulator):
         return [reduce_sum(x, axis, STORE[out_dt], *RANGE[out_dt], self._cbuf, c0, parts)]
 
     def k_CONV2D(self, o: OpInfo, x: torch.Tensor) -> list[torch.Tensor] | None:
-        from .kernels.conv import MAX_K, linear
+        from .kernels.conv import MAX_K, Geometry, conv2d
         a, g = o.attrs, self.g
         w = self._stored_const(o, 1)
         in_dt, out_dt = g.dtype(o.inputs[0]), g.dtype(o.outputs[0])
         N, IH, IW, IC = x.shape
         OC, KH, KW, _ = w.shape
-        M = N * IH * IW
-        if KH != 1 or KW != 1 or tuple(a["Stride"]) != (1, 1) or any(a["Pad"]) or g.dtype(o.inputs[1]) != "INT8" \
-                or (in_dt, out_dt) not in (("INT8", "INT32"), ("INT16", "INT48")) or IC > MAX_K or M == 0 or OC == 0 \
-                or OC * IC >= 2**31 or OC > 65535 * 64:
+        geo = Geometry((KH, KW), tuple(a["Stride"]), tuple(a["Pad"]), tuple(a["Dilation"]))
+        OH, OW = geo.out_hw(IH, IW)
+        K, M = KH * KW * IC, N * OH * OW
+        if g.dtype(o.inputs[1]) != "INT8" or (in_dt, out_dt) not in (("INT8", "INT32"), ("INT16", "INT48")) \
+                or K > MAX_K or OH <= 0 or OW <= 0 or M == 0 or OC == 0 or OC * K >= 2**31 or OC > 65535 * 64 \
+                or x.numel() >= 2**31 or M * OC >= 2**31:
             return None
-        parts = self._sample_parts(o, (N, IH, IW, OC))
+        parts = self._sample_parts(o, (N, OH, OW, OC))
         if parts > 1 and M % parts:  # the samples would split the output channels, but this kernel counts per row
             return None
         weights = self._conv_weights.get(o.idx)
         if weights is None:
-            w2 = w.reshape(OC, IC).contiguous()
+            w2 = w.reshape(OC, K).contiguous()
             bias = self._stored_const(o, 2).reshape(-1).to(torch.int64).expand(OC).contiguous()
             weights = self._conv_weights[o.idx] = (w2, w2.sum(1, dtype=torch.int64), bias)
         w2, wsum, bias64 = weights
         saturate = out_dt == "INT48"
         c0 = self._new_require_counter(o, Require.ACC_INT48 if saturate else Require.ACC_INT32, parts)
-        y = linear(x.reshape(M, IC).contiguous(), w2, bias64, wsum, STORE[out_dt], self._scalar(o.inputs[3]),
+        y = conv2d(x.contiguous(), w2, bias64, wsum, geo, STORE[out_dt], self._scalar(o.inputs[3]),
                    self._scalar(o.inputs[4]), *RANGE[out_dt], saturate, self._cbuf, c0, parts)
-        return [y.reshape(N, IH, IW, OC)]
+        return [y.reshape(N, OH, OW, OC)]
 
     def k_GREATER(self, _: OpInfo, a: torch.Tensor, b: torch.Tensor) -> list[torch.Tensor] | None:
         return [(a > b).to(torch.int8)]
